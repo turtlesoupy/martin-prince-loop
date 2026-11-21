@@ -9,8 +9,16 @@ A Codex skill that takes Codex's own composer prediction (the suggested next mes
 Needs Python 3.10+, a recent Codex desktop app/CLI (`thread/sample` and `codex queue`), and a ChatGPT login in `auth.json`. Tested on macOS.
 
 ```sh
-git clone https://github.com/turtlesoupy/martin-prince-loop.git
-ln -s "$PWD/martin-prince-loop" "${CODEX_HOME:-$HOME/.codex}/skills/martin-prince-loop"
+repo=martin-prince-loop
+url=https://github.com
+git clone \
+  "$url/turtlesoupy/$repo.git"
+
+base="$HOME/.codex"
+base="${CODEX_HOME:-$base}"
+skills="$base/skills"
+mkdir -p "$skills"
+ln -s "$PWD/$repo" "$skills/"
 ```
 
 ## Use
