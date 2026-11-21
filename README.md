@@ -11,14 +11,16 @@ Needs Python 3.10+, a recent Codex desktop app/CLI (`thread/sample` and `codex q
 ```sh
 repo=martin-prince-loop
 url=https://github.com
+owner=turtlesoupy
 git clone \
-  "$url/turtlesoupy/$repo.git"
+  "$url/$owner/$repo.git"
 
 base="$HOME/.codex"
 base="${CODEX_HOME:-$base}"
 skills="$base/skills"
 mkdir -p "$skills"
-ln -s "$PWD/$repo" "$skills/"
+ln -s \
+  "$PWD/$repo" "$skills/"
 ```
 
 ## Use
