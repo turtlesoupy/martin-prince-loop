@@ -1,5 +1,6 @@
 import unittest
 import loop
+from pathlib import Path
 import test_same_chat
 
 
@@ -8,6 +9,9 @@ class MessageTests(unittest.TestCase):
     do = test_same_chat.SameChatTests.do
     def setUp(self):
         test_same_chat.SameChatTests.setUp(self)
+        context = Path(self.temp.name) / 'context.json'
+        context.write_text('{}')
+        self.state['taskContextFile'] = str(context)
         self.state['mode'] = 'chat-messages'
         self.args.receipt = 'accepted'
         self.following = []
@@ -72,6 +76,22 @@ class MessageTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'resume-message'): self.send(sender, retry=True)
         self.assertEqual(self.state['proposal']['sendAttempts'], 1)
 
+
+    def test_missing_task_context_fails_without_sampling_raw_history(self):
+        del self.state['taskContextFile']
+        with self.assertRaisesRegex(ValueError, 'task-context-file'):
+            self.do('next')
+        self.assertEqual(self.samples, [])
+
+    def test_meta_delivery_can_reuse_task_checkpoint_within_budget(self):
+        self.do('next'); self.do('prepare-send'); self.do('sent')
+        self.source.turn = 'delivered'
+        self.source.fingerprint = 'new-input'
+        self.following = [{'turn':'delivered','status':'inProgress','messages':[self.suggestion]}]
+        self.do('resume-message'); self.do('next')
+        self.assertEqual(self.state['phase'], 'proposed')
+        self.assertEqual(self.state['completedIterations'], 1)
+        self.assertEqual(self.samples[0], self.samples[1])
 
 class PredictionRetryTests(unittest.TestCase):
     predict = test_same_chat.SameChatTests.predict

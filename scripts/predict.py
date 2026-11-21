@@ -235,19 +235,57 @@ def checkpoint_records(records, turn, checkpoint):
     return kept, removed
 
 
+def task_projection(records, context, thread):
+    """Select exact task messages by position and digest; never rewrite source history."""
+    if context.get('version') != 1 or context.get('threadId') != thread:
+        raise ValueError('Task context must belong to this thread and use version 1.')
+    selections = context.get('messages', [])
+    if not selections:
+        raise ValueError('Task context needs at least one source message.')
+    selected = []
+    previous = -1
+    for entry in selections:
+        index = entry['index']
+        if not isinstance(index, int) or index <= previous or index >= len(records):
+            raise ValueError('Task message indices must be valid and strictly increasing.')
+        record = records[index]
+        digest = hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+        if digest != entry['sha256']:
+            raise ValueError('Task context source changed; rebuild explicitly, never silently rebase.')
+        payload = record.get('payload', {})
+        if record.get('type') != 'response_item' or payload.get('type') != 'message' or payload.get('role') not in ('user', 'assistant'):
+            raise ValueError('Task context may select only user or assistant messages.')
+        selected.append(record)
+        previous = index
+    # Keep runtime instructions, but exclude tools, reasoning, compaction summaries,
+    # duplicate event-message text, and unselected conversational messages.
+    retained = [r for r in records if r.get('type') == 'session_meta' or
+        (r.get('type') == 'response_item' and r.get('payload', {}).get('role') in ('system', 'developer'))]
+    starts = [r for r in records if r.get('type') == 'event_msg' and r.get('payload', {}).get('type') == 'task_started']
+    if not starts:
+        raise ValueError('Task context needs an active turn boundary.')
+    return retained + [starts[-1]] + selected
+
+
 @contextmanager
-def snapshot(source, scratch=None, idle=False, checkpoint=None):
+def snapshot(source, scratch=None, idle=False, checkpoint=None, task_context=None):
     if checkpoint is not None:
         if idle or not isinstance(checkpoint, str) or not checkpoint.strip():
             raise ValueError('Provide a nonempty checkpoint for same-chat mode; do not combine it with require-idle.')
         turn, rollout = source.latest(), source.rollout()
         original = source.records()
-        records, removed = checkpoint_records(original, turn, checkpoint)
+        projected = task_projection(original, task_context, source.thread) if task_context is not None else original
+        records, removed = checkpoint_records(projected, turn, checkpoint)
         turn = {**turn, 'status': 'completed', 'snapshotMode': 'active-checkpoint',
             'userFingerprint': user_fingerprint(original), 'removedPendingCalls': removed,
             'checkpointDigest': hashlib.sha256(checkpoint.encode()).hexdigest()}
+        if task_context is not None:
+            turn['taskContextDigest'] = hashlib.sha256(json.dumps(task_context, sort_keys=True).encode()).hexdigest()
+            turn['taskMessageCount'] = len(task_context['messages'])
         data = ''.join(json.dumps(r) + '\n' for r in records).encode()
     else:
+        if task_context is not None:
+            raise ValueError('Task context requires a factual task checkpoint.')
         turn, rollout = source.boundary(idle=idle)
         with rollout.open('rb') as stream:
             data = stream.read(turn['end'])
@@ -331,10 +369,10 @@ class RPC:
             stream.close()
 
 
-def predict(source, cli=None, scratch=None, idle=False, checkpoint=None, timeout=DEFAULT_TIMEOUT):
+def predict(source, cli=None, scratch=None, idle=False, checkpoint=None, task_context=None, timeout=DEFAULT_TIMEOUT):
     config = configuration(source.home)
     executable = find_cli(cli)
-    with snapshot(source, scratch=scratch, idle=idle, checkpoint=checkpoint) as (_, copied, turn, env):
+    with snapshot(source, scratch=scratch, idle=idle, checkpoint=checkpoint, task_context=task_context) as (_, copied, turn, env):
         rpc = RPC(executable, env)
         try:
             rpc.call('initialize', {'clientInfo': {'name': 'martin_prince_loop', 'version': '0.2.0'},
@@ -362,8 +400,8 @@ def predict(source, cli=None, scratch=None, idle=False, checkpoint=None, timeout
     if suggestion is not None and (not isinstance(suggestion, str) or not suggestion.strip()):
         raise RuntimeError('Invalid suggestion format.')
     return {'threadId': source.thread, 'sourceTurnId': turn['turn'], 'promptVersion': config.get('prompt_version'),
-        'method': 'thread/sample', 'context': 'isolated active-turn checkpoint' if checkpoint is not None else 'isolated completed-turn snapshot',
-        **{key: turn[key] for key in ('userFingerprint', 'checkpointDigest', 'removedPendingCalls') if key in turn},
+        'method': 'thread/sample', 'context': 'isolated task transcript' if task_context is not None else ('isolated active-turn checkpoint' if checkpoint is not None else 'isolated completed-turn snapshot'),
+        **{key: turn[key] for key in ('userFingerprint', 'checkpointDigest', 'removedPendingCalls', 'taskContextDigest', 'taskMessageCount') if key in turn},
         'suggestion': suggestion,
         'responseId': result.get('responseId'),
         'usage': {key: result.get(key) for key in ('inputTokens', 'cachedInputTokens', 'outputTokens')}}
@@ -372,6 +410,7 @@ def predict(source, cli=None, scratch=None, idle=False, checkpoint=None, timeout
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--thread', help='Defaults to the current Codex chat environment.')
+    parser.add_argument('--task-context-file', help='Private manifest selecting exact source task messages.')
     parser.add_argument('--checkpoint-file', help='Factual assistant checkpoint for the current active turn.')
     parser.add_argument('--codex-home')
     parser.add_argument('--sqlite-home')
@@ -387,7 +426,8 @@ def main():
     try:
         result = predict(Source.resolve(args.thread, args.codex_home, args.sqlite_home),
             cli=args.cli, scratch=args.scratch, idle=args.require_idle, timeout=args.timeout,
-            checkpoint=Path(args.checkpoint_file).read_text() if args.checkpoint_file else None)
+            checkpoint=Path(args.checkpoint_file).read_text() if args.checkpoint_file else None,
+            task_context=json.loads(Path(args.task_context_file).read_text()) if args.task_context_file else None)
         if args.output:
             write_json(args.output, result)
         print(json.dumps(result, indent=2))

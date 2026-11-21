@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 from pathlib import Path
 import sqlite3
@@ -151,3 +152,16 @@ class HistoryFixture(unittest.TestCase):
     def test_same_chat_defaults_from_environment(self):
         with patch.dict(os.environ, {'CODEX_THREAD_ID':'current-chat'}):
             self.assertEqual(predict.Source.resolve(home=self.home, sqlite_home=self.home).thread, 'current-chat')
+
+    def test_task_snapshot_excludes_tools_and_keeps_full_source_fingerprint(self):
+        original = self.active_records()
+        context = {'version':1,'threadId':'target','messages':[{'index':2,
+            'sha256':hashlib.sha256(json.dumps(original[2],sort_keys=True).encode()).hexdigest()}]}
+        with predict.snapshot(self.source, self.scratch, checkpoint='Fixture inspected.', task_context=context) as (_, copied, turn, _):
+            text = copied.read_text()
+            self.assertIn('Fix the fixture', text)
+            self.assertNotIn('call_id', text)
+            self.assertEqual(turn['taskMessageCount'], 1)
+            self.assertEqual(turn['userFingerprint'], predict.user_fingerprint(original))
+            self.assertIn('taskContextDigest', turn)
+        self.assertEqual(self.source.records(), original)

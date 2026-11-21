@@ -21,7 +21,11 @@ In any Codex chat:
 $martin-prince-loop
 ```
 
-Each round samples a fresh prediction from a temporary copy of the chat, queues it with `codex queue`, and picks the loop back up when the message arrives. It stops early on a null prediction, an error, a message you type yourself, or anything that needs your approval.
+Each round samples a fresh prediction from a selected task transcript, queues it with `codex queue`, and picks the loop back up when the message arrives. It stops early on a null prediction, an error, a message you type yourself, or anything that needs your approval.
+
+The predictor sees exact task messages and a task-only checkpoint, while loop counts, receipts, and orchestration chatter stay outside its context. A private source-hashed manifest records the selection; the full chat still governs permissions and delivery checks.
+
+In a [nine-sample comparison](references/context-experiment.md), both full-history conditions produced loop-continuation suggestions in 3/3 samples each; the task transcript produced task-focused suggestions in 3/3. This is a small single-task result, not a general quality guarantee.
 
 See [SKILL.md](SKILL.md) for the full workflow and [references/supervise.md](references/supervise.md) to drive a different chat.
 
