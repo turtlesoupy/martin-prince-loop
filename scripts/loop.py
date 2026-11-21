@@ -113,11 +113,9 @@ def operate_same_chat(state, command, args, source, predictor):
         digest = hashlib.sha256(checkpoint.encode()).hexdigest()
         if state.get('mode') != 'chat-messages' and state['history'] and digest == state['history'][-1]['checkpointDigest']:
             return halt(state, 'Unchanged checkpoint; do not predict repeatedly from the same work summary.')
-        context_path = state.get('taskContextFile')
-        if state.get('mode') == 'chat-messages' and not context_path:
-            raise ValueError('Message mode requires --task-context-file at init; raw orchestration history is not a task context.')
-        extra = {'task_context': json.loads(Path(context_path).read_text())} if context_path else {}
-        proposal = sample(state, args, source, predictor, checkpoint=checkpoint, **extra)
+        # Preserve all saved conversation context, including skill invocations and
+        # human steering. Legacy selection manifests must not filter predictions.
+        proposal = sample(state, args, source, predictor, checkpoint=checkpoint)
         state['proposal'] = proposal
         if (not same_context(state, source) or proposal.get('sourceTurnId') != state['originTurnId']
                 or proposal.get('userFingerprint') != state['userFingerprint']):
@@ -306,7 +304,6 @@ def main():
     init.add_argument('--thread', help='Defaults to the current Codex chat.')
     init.add_argument('--mode', choices=['chat-messages', 'same-chat', 'supervise'], default='chat-messages')
     init.add_argument('--scope', required=True)
-    init.add_argument('--task-context-file', help='Required for chat-messages: private source-message manifest.')
     init.add_argument('--max-iterations', type=int, default=5)
     init.add_argument('--max-minutes', type=float, default=30)
     init.add_argument('--codex-home')
@@ -349,8 +346,6 @@ def main():
                     raise ValueError('Scope and positive iteration/time limits are required.')
                 if not math.isfinite(args.timeout) or args.timeout <= 0 or args.retries < 0:
                     raise ValueError('Timeout must be positive and retries cannot be negative.')
-                if args.mode == 'chat-messages' and not args.task_context_file:
-                    raise ValueError('chat-messages requires --task-context-file; keep bookkeeping out of predictions.')
                 source = Source.resolve(args.thread, args.codex_home, args.sqlite_home)
                 latest = source.latest()
                 if args.mode in ('same-chat', 'chat-messages') and latest['status'] != 'inProgress':
@@ -359,7 +354,7 @@ def main():
                     'maxIterations': args.max_iterations, 'completedIterations': 0,
                     'deadline': time.time() + args.max_minutes * 60, 'createdAt': now(), 'updatedAt': now(),
                     'codexHome': str(source.home), 'sqliteHome': str(source.sqlite_home), 'cli': args.cli,
-                    'taskContextFile': str(Path(args.task_context_file).resolve()) if args.task_context_file else None,
+                    'contextMode': 'full-conversation',
                     'timeout': args.timeout, 'retries': args.retries, 'scratch': args.scratch, 'phase': 'ready', 'history': []}
                 if args.mode in ('same-chat', 'chat-messages'):
                     state['originTurnId'] = latest['turn']

@@ -77,11 +77,25 @@ class MessageTests(unittest.TestCase):
         self.assertEqual(self.state['proposal']['sendAttempts'], 1)
 
 
-    def test_missing_task_context_fails_without_sampling_raw_history(self):
+    def test_full_history_without_manifest(self):
         del self.state['taskContextFile']
-        with self.assertRaisesRegex(ValueError, 'task-context-file'):
-            self.do('next')
-        self.assertEqual(self.samples, [])
+        def predictor(source, **kwargs):
+            self.assertNotIn('task_context', kwargs)
+            return self.predict(source, **kwargs)
+        loop.operate(self.state, 'next', self.args, source=self.source, predictor=predictor)
+        self.assertEqual(self.state['phase'], 'proposed')
+
+    def test_legacy_manifest_cannot_filter_history_or_reset_budget(self):
+        self.state['taskContextFile'] = '/nonexistent/legacy-context.json'
+        self.state['completedIterations'] = 1
+        deadline = self.state['deadline']
+        def predictor(source, **kwargs):
+            self.assertNotIn('task_context', kwargs)
+            return self.predict(source, **kwargs)
+        loop.operate(self.state, 'next', self.args, source=self.source, predictor=predictor)
+        self.assertEqual(self.state['phase'], 'proposed')
+        self.assertEqual(self.state['completedIterations'], 1)
+        self.assertEqual(self.state['deadline'], deadline)
 
     def test_meta_delivery_can_reuse_task_checkpoint_within_budget(self):
         self.do('next'); self.do('prepare-send'); self.do('sent')
