@@ -49,7 +49,7 @@ The loop does not stop because a suggestion is meta, repetitive, low-value, or t
 
 The reader fetches the live composer-prediction configuration and calls `thread/sample`. It copies the current saved rollout and closes the active turn only in that temporary copy using a factual checkpoint. This creates a fresh prediction, not a copy of cached composer text; runtime settings and display filters can differ.
 
-The default `chat-messages` ledger records intent before sending, acceptance after the CLI returns its queue item ID, and delivery only after the exact message appears in the next active turn. An uncertain send must be reconciled rather than replayed. Same-chat continuation relies on the agent retaining the skill and state path across turns. The tested desktop messaging tool injects tool output, so this workflow uses `codex queue` instead. CLI queueing has been verified to persist the exact text as `UserInput`; consuming it into a new turn must be verified separately. An outstanding queued item must never be blindly resent.
+The default `chat-messages` ledger records intent before sending, acceptance after the CLI returns its queue item ID, and delivery only after the exact message appears in the next active turn. An uncertain send must be reconciled rather than replayed. Same-chat continuation relies on the agent retaining the skill and state path across turns. The tested desktop messaging tool injects tool output, so this workflow uses `codex queue` instead. CLI queueing persists the exact text as `UserInput`. The desktop consumes the queued message after the current turn ends, and the next turn resumes the same run. These turn boundaries are handoffs, not loop stops. An outstanding queued item must never be blindly resent.
 
 ## Install
 
@@ -73,6 +73,10 @@ Source files are read-only. Temporary snapshots contain selected chat history, a
 python3 -m unittest discover -s tests -v
 ```
 
-Tests cover snapshot isolation, ledger progression, budget enforcement, exact-message reconciliation, and unexpected human input. Actual message delivery must also be verified in the running desktop app; ledger tests alone do not prove desktop queue consumption.
+The 31 tests cover snapshot isolation, ledger progression, budget enforcement, exact-message reconciliation, and unexpected human input.
+
+A live macOS run on November 21, 2026 verified **five real predicted messages delivered into five distinct turns** through `codex queue`, without restarting the app. Each delivery matched its saved prediction, including meta requests to continue. The ledger reached `complete` at exactly five deliveries, and no sixth message was sent. The first queued item was reconciled into the existing run after the earlier messaging-tool experiment failed; subsequent predictions proceeded through the normal queue/resume workflow. Private run state and conversation history are not included in this repository.
+
+This verifies the tested desktop/CLI version, not compatibility with every version. Each run still verifies delivery rather than treating queue acceptance as completion.
 
 MIT licensed. The name and portrait are an homage; this project is not affiliated with The Simpsons or OpenAI.
