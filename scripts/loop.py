@@ -94,8 +94,6 @@ def operate_same_chat(state, command, args, source, predictor):
             return halt(state, 'Codex returned no suggested next action.')
         if not proposal.get('responseId'):
             return halt(state, 'Prediction did not include a response ID.')
-        if any(normalize(step['suggestion']) == normalize(suggestion) for step in state['history']):
-            return halt(state, 'Repeated suggestion; no automatic replay.')
         state['phase'] = 'proposed'
     elif command == 'begin-step':
         if phase != 'proposed':
@@ -123,6 +121,42 @@ def operate_same_chat(state, command, args, source, predictor):
     return state
 
 
+def operate_messages(state, command, args, source, predictor):
+    """Queue exact predictions through a connector; resume only observed messages."""
+    if command == 'resume-message':
+        if state['phase'] not in ('dispatching', 'waiting'):
+            raise RuntimeError('No outstanding message to reconcile.')
+        following = source.continuation(state['proposal']['sourceTurnId'])
+        if not following:
+            raise RuntimeError('Queued message is not visible yet; do not resend.')
+        if len(following) != 1 or following[0]['messages'] != [state['proposal']['suggestion'].strip()]:
+            return halt(state, 'Unexpected human input; reconcile before continuing.')
+        turn = following[0]
+        if turn['status'] != 'inProgress' or source.latest()['turn'] != turn['turn']:
+            return halt(state, 'Resume from the active delivered-message turn only.')
+        state['proposal']['deliveredTurnId'] = turn['turn']
+        state['history'].append(state.pop('proposal'))
+        state['completedIterations'] += 1
+        state['originTurnId'] = turn['turn']
+        state['userFingerprint'] = source.user_fingerprint()
+        state['phase'] = 'complete' if state['completedIterations'] >= state['maxIterations'] else 'ready'
+        return state
+    if command == 'prepare-send':
+        operate_same_chat(state, 'begin-step', args, source, predictor)
+        if state['phase'] == 'executing':
+            state['phase'] = 'dispatching'
+        return state
+    if command == 'sent':
+        if state['phase'] != 'dispatching' or not args.receipt.strip():
+            raise RuntimeError('Record connector acceptance only for a prepared message.')
+        state['proposal']['receipt'] = args.receipt
+        state['phase'] = 'waiting'
+        return state
+    if command != 'next':
+        raise RuntimeError('Message mode requires next, prepare-send, sent, or resume-message.')
+    return operate_same_chat(state, command, args, source, predictor)
+
+
 def operate(state, command, args, source=None, predictor=predict):
     """Mutate state; no connector calls or shell execution of generated text."""
     state['updatedAt'] = now()
@@ -135,6 +169,8 @@ def operate(state, command, args, source=None, predictor=predict):
     if command in ('next', 'prepare-send', 'begin-step') and time.time() >= state['deadline']:
         return halt(state, 'Time budget reached.')
     source = source or source_for(state)
+    if state.get('mode') == 'chat-messages':
+        return operate_messages(state, command, args, source, predictor)
     if state.get('mode', 'supervise') == 'same-chat':
         return operate_same_chat(state, command, args, source, predictor)
     phase = state['phase']
@@ -162,8 +198,6 @@ def operate(state, command, args, source=None, predictor=predict):
             return halt(state, 'Codex returned no suggested next message.')
         if not isinstance(proposal.get('responseId'), str) or not proposal['responseId']:
             return halt(state, 'Prediction did not include a response ID.')
-        if any(normalize(item['suggestion']) == normalize(suggestion) for item in state['history']):
-            return halt(state, 'Repeated suggestion; no automatic replay.')
         state['phase'] = 'proposed'
     elif command == 'prepare-send':
         if phase != 'proposed':
@@ -215,7 +249,7 @@ def main():
     init = sub.add_parser('init')
     init.add_argument('--state', required=True)
     init.add_argument('--thread', help='Defaults to the current Codex chat.')
-    init.add_argument('--mode', choices=['same-chat', 'supervise'], default='same-chat')
+    init.add_argument('--mode', choices=['chat-messages', 'same-chat', 'supervise'], default='chat-messages')
     init.add_argument('--scope', required=True)
     init.add_argument('--max-iterations', type=int, default=5)
     init.add_argument('--max-minutes', type=float, default=30)
@@ -223,7 +257,7 @@ def main():
     init.add_argument('--sqlite-home')
     init.add_argument('--cli')
     init.add_argument('--scratch')
-    for name in ('next', 'begin-step', 'finish-step', 'prepare-send', 'sent', 'complete-step', 'status', 'stop'):
+    for name in ('next', 'begin-step', 'finish-step', 'prepare-send', 'sent', 'complete-step', 'resume-message', 'status', 'stop'):
         cmd = sub.add_parser(name)
         cmd.add_argument('--state', required=True)
         if name == 'next':
@@ -250,14 +284,14 @@ def main():
                     raise ValueError('Scope and positive iteration/time limits are required.')
                 source = Source.resolve(args.thread, args.codex_home, args.sqlite_home)
                 latest = source.latest()
-                if args.mode == 'same-chat' and latest['status'] != 'inProgress':
+                if args.mode in ('same-chat', 'chat-messages') and latest['status'] != 'inProgress':
                     raise RuntimeError('Invoke the skill in an active chat for same-chat mode.')
                 state = {'version': 2, 'mode': args.mode, 'threadId': source.thread, 'scope': args.scope,
                     'maxIterations': args.max_iterations, 'completedIterations': 0,
                     'deadline': time.time() + args.max_minutes * 60, 'createdAt': now(), 'updatedAt': now(),
                     'codexHome': str(source.home), 'sqliteHome': str(source.sqlite_home), 'cli': args.cli,
                     'scratch': args.scratch, 'phase': 'ready', 'history': []}
-                if args.mode == 'same-chat':
+                if args.mode in ('same-chat', 'chat-messages'):
                     state['originTurnId'] = latest['turn']
                     state['userFingerprint'] = source.user_fingerprint()
             else:

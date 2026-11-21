@@ -86,11 +86,11 @@ class ControllerTests(unittest.TestCase):
         self.do('next'); self.do('next')
         self.assertEqual(self.samples, 1)
 
-    def test_repeated_suggestion_stops(self):
+    def test_repeated_suggestion_is_allowed(self):
         self.dispatch(); self.finish('first')
         self.do('next')
-        self.assertEqual(self.state['phase'], 'stopped')
-        self.assertIn('Repeated', self.state['stopReason'])
+        self.assertEqual(self.state['phase'], 'proposed')
+        self.assertEqual(self.state['proposal']['suggestion'], self.state['history'][0]['suggestion'])
 
     def test_expired_budget_cannot_dispatch_existing_proposal(self):
         self.do('next'); self.state['deadline'] = time.time()-1
