@@ -1,4 +1,5 @@
 import unittest
+import loop
 import test_same_chat
 
 
@@ -29,3 +30,22 @@ class MessageTests(unittest.TestCase):
         self.following = [{'turn':'human', 'status':'inProgress', 'messages':['Stop']}]
         self.do('resume-message')
         self.assertEqual(self.state['phase'], 'stopped')
+
+    def test_send_queues_exact_text_once_then_waits(self):
+        sent = []
+        def sender(state, text):
+            sent.append(text); return 'queued item-1'
+        self.do('next'); self.do('prepare-send')
+        loop.operate(self.state, 'send', self.args, source=self.source, predictor=self.predict, sender=sender)
+        self.assertEqual(sent, [self.suggestion])
+        self.assertEqual(self.state['proposal']['receipt'], 'queued item-1')
+        with self.assertRaisesRegex(RuntimeError, 'No prepared'):
+            loop.operate(self.state, 'send', self.args, source=self.source, predictor=self.predict, sender=sender)
+        self.assertEqual(len(sent), 1)
+
+    def test_failed_send_stays_dispatching(self):
+        def sender(state, text): raise RuntimeError('codex queue exited 1')
+        self.do('next'); self.do('prepare-send')
+        with self.assertRaisesRegex(RuntimeError, 'exited 1'):
+            loop.operate(self.state, 'send', self.args, source=self.source, predictor=self.predict, sender=sender)
+        self.assertEqual(self.state['phase'], 'dispatching')

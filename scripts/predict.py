@@ -176,6 +176,8 @@ def configuration(home):
             config = json.load(response)
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f'Prediction configuration request returned HTTP {exc.code}; no fallback prompt was used.') from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f'Could not reach the prediction configuration endpoint: {exc.reason}') from exc
     if not config.get('is_enabled') or not isinstance(config.get('prompt'), str) or not config['prompt']:
         raise RuntimeError('The live prediction prompt is disabled or unavailable; no fallback prompt was used.')
     return config
@@ -313,7 +315,10 @@ class RPC:
         try:
             self.process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            os.killpg(self.process.pid, signal.SIGKILL)
+            try:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             self.process.wait()
         self.reader.join(timeout=1)
         for stream in (self.process.stdin, self.process.stdout):

@@ -10,9 +10,10 @@ import math
 import os
 from pathlib import Path
 import signal
+import subprocess
 import time
 
-from predict import Source, predict, write_json
+from predict import Source, find_cli, predict, write_json
 
 
 def now():
@@ -48,14 +49,18 @@ def source_for(state):
 
 def fresh(state, source):
     latest = source.latest()
-    proposal = state['proposal']
-    if latest['status'] != 'completed' or latest['turn'] != proposal['sourceTurnId']:
-        return False
-    return True
+    return latest['status'] == 'completed' and latest['turn'] == state['proposal']['sourceTurnId']
 
 
-def normalize(text):
-    return ' '.join(text.split()).casefold()
+def queue_message(state, text):
+    """Queue text as a real user message with the Codex CLI. Never goes through a shell."""
+    result = subprocess.run([find_cli(state['cli']), 'queue', '--thread', state['threadId'], '--message', text],
+        capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f'codex queue exited {result.returncode}: {detail}. The message may still be queued; '
+            'reconcile with resume-message before retrying.')
+    return result.stdout.strip() or 'codex queue exited 0'
 
 
 def same_context(state, source):
@@ -121,8 +126,8 @@ def operate_same_chat(state, command, args, source, predictor):
     return state
 
 
-def operate_messages(state, command, args, source, predictor):
-    """Queue exact predictions through a connector; resume only observed messages."""
+def operate_messages(state, command, args, source, predictor, sender):
+    """Queue exact predictions with codex queue; resume only observed messages."""
     if command == 'resume-message':
         if state['phase'] not in ('dispatching', 'waiting'):
             raise RuntimeError('No outstanding message to reconcile.')
@@ -146,33 +151,23 @@ def operate_messages(state, command, args, source, predictor):
         if state['phase'] == 'executing':
             state['phase'] = 'dispatching'
         return state
-    if command == 'sent':
-        if state['phase'] != 'dispatching' or not args.receipt.strip():
-            raise RuntimeError('Record connector acceptance only for a prepared message.')
-        state['proposal']['receipt'] = args.receipt
+    if command in ('send', 'sent'):
+        if state['phase'] != 'dispatching':
+            raise RuntimeError('No prepared message; do not send another.')
+        # 'send' queues the message itself; 'sent' records a send done by hand.
+        receipt = sender(state, state['proposal']['suggestion']) if command == 'send' else args.receipt
+        if not receipt.strip():
+            raise RuntimeError('A queue receipt is required.')
+        state['proposal']['receipt'] = receipt
         state['phase'] = 'waiting'
         return state
     if command != 'next':
-        raise RuntimeError('Message mode requires next, prepare-send, sent, or resume-message.')
+        raise RuntimeError('Message mode requires next, prepare-send, send, sent, or resume-message.')
     return operate_same_chat(state, command, args, source, predictor)
 
 
-def operate(state, command, args, source=None, predictor=predict):
-    """Mutate state; no connector calls or shell execution of generated text."""
-    state['updatedAt'] = now()
-    if command == 'status':
-        return state
-    if command == 'stop':
-        return halt(state, args.reason)
-    if state['phase'] in ('stopped', 'complete'):
-        raise RuntimeError('This run has ended; create a new state file for a new authorized run.')
-    if command in ('next', 'prepare-send', 'begin-step') and time.time() >= state['deadline']:
-        return halt(state, 'Time budget reached.')
-    source = source or source_for(state)
-    if state.get('mode') == 'chat-messages':
-        return operate_messages(state, command, args, source, predictor)
-    if state.get('mode', 'supervise') == 'same-chat':
-        return operate_same_chat(state, command, args, source, predictor)
+def operate_supervise(state, command, args, source, predictor):
+    """Drive another chat; the caller sends each message with send_message_to_thread."""
     phase = state['phase']
     if command == 'next':
         if phase == 'proposed':
@@ -243,6 +238,25 @@ def operate(state, command, args, source=None, predictor=predict):
     return state
 
 
+def operate(state, command, args, source=None, predictor=predict, sender=queue_message):
+    """Advance the run state. Only 'send' talks to Codex, and never through a shell."""
+    state['updatedAt'] = now()
+    if command == 'status':
+        return state
+    if command == 'stop':
+        return halt(state, args.reason)
+    if state['phase'] in ('stopped', 'complete'):
+        raise RuntimeError('This run has ended; create a new state file for a new authorized run.')
+    if command in ('next', 'prepare-send', 'begin-step') and time.time() >= state['deadline']:
+        return halt(state, 'Time budget reached.')
+    source = source or source_for(state)
+    if state['mode'] == 'chat-messages':
+        return operate_messages(state, command, args, source, predictor, sender)
+    if state['mode'] == 'same-chat':
+        return operate_same_chat(state, command, args, source, predictor)
+    return operate_supervise(state, command, args, source, predictor)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -257,7 +271,7 @@ def main():
     init.add_argument('--sqlite-home')
     init.add_argument('--cli')
     init.add_argument('--scratch')
-    for name in ('next', 'begin-step', 'finish-step', 'prepare-send', 'sent', 'complete-step', 'resume-message', 'status', 'stop'):
+    for name in ('next', 'begin-step', 'finish-step', 'prepare-send', 'send', 'sent', 'complete-step', 'resume-message', 'status', 'stop'):
         cmd = sub.add_parser(name)
         cmd.add_argument('--state', required=True)
         if name == 'next':
@@ -296,7 +310,7 @@ def main():
                     state['userFingerprint'] = source.user_fingerprint()
             else:
                 state = json.loads(path.read_text())
-                if state.get('version') not in (1, 2):
+                if state.get('version') != 2:
                     raise RuntimeError('Unsupported controller state version.')
                 state = operate(state, args.command, args)
             if args.command != 'status':

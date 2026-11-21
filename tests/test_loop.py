@@ -18,7 +18,7 @@ class FakeSource:
 
 class ControllerTests(unittest.TestCase):
     def setUp(self):
-        self.state = {'phase':'ready','deadline':time.time()+600,'maxIterations':2,
+        self.state = {'mode':'supervise','phase':'ready','deadline':time.time()+600,'maxIterations':2,
             'completedIterations':0,'history':[],'cli':None,'scratch':None}
         self.source = FakeSource()
         self.args = SimpleNamespace(response_id='response', review='Within the authorized test task', receipt='accepted', reason='User stopped')
