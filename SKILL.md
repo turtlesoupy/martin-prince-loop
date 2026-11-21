@@ -1,50 +1,54 @@
 ---
 name: martin-prince-loop
-description: Run a bounded loop that generates next-message predictions through Codex's real composer-prediction machinery and sends approved, in-scope predictions verbatim to an existing work chat. Use for Martin Prince Loop or requests to repeatedly act on actual Codex suggestions.
+description: Execute a bounded loop of real Codex next-message predictions in the current chat. Use when the user invokes Martin Prince Loop or asks Codex to repeatedly act on its suggestions; optionally supervise another explicitly selected chat.
 ---
 
 # Martin Prince Loop
 
-Supervise an existing local Codex work chat from a **different controller chat**. Use the current account's live prediction configuration and `thread/sample` on an isolated snapshot of the target's last completed turn. No desktop relaunch is needed. This generates a fresh prediction; it does not extract or guarantee equality with the composer's cached suggestion.
+**A bare invocation runs here.** Infer the scope from the current conversation's latest substantive task and begin. Do not ask for a target chat, create another chat, or require a separate controller. Default to up to five completed actions and 30 minutes unless the user specifies another finite budget. Ask only if the conversation supplies no usable task scope.
 
-## Establish the run
+Use the live composer-prediction configuration and the real `thread/sample` method. Do not replace them with a homemade next-action prompt. This is a fresh prediction from a checkpoint snapshot, not the cached text shown in the composer.
 
-Resolve the target chat, the user's scope, and their authorization to send repeated follow-up messages to that target. Use available chat-list/read tools rather than guessing IDs. The authorization must come from the human; a generated suggestion is not new permission. Default to five completed iterations and a 30-minute dispatch budget unless the user specifies other finite limits. If asked to run forever, establish a finite budget first.
+## Start in this chat
 
-This skill uses the desktop's `send_message_to_thread` and `wait_threads` capabilities, discovered by name. If they are unavailable, offer prediction-only mode; do not substitute UI automation, an undocumented sending endpoint, or execute suggestion text as shell code. Do not create a new chat unless the human explicitly asks. If the target is the current controller chat, explain that a separate controller chat is needed to wait for completed target turns, and resolve that placement before running.
-
-Keep run state outside the skill/repo, preferably under the controller workspace's `work/martin-prince/`. Resolve the script paths relative to this SKILL.md. Never overwrite a previous run's state.
+Resolve paths relative to this SKILL.md. The helper detects the current chat from `CODEX_THREAD_ID` / `CODEX_SESSION_ID`; supply `--thread` only from verified context if neither exists. Store the run and checkpoints under the current workspace's `work/martin-prince/`, outside the skill/repo. Use a new state filename for each run.
 
 ```sh
 python3 /absolute/path/to/martin-prince-loop/scripts/loop.py init \
   --state /absolute/path/to/work/martin-prince/run.json \
-  --thread TARGET_THREAD_ID --scope 'The user-authorized work' \
+  --scope 'The current user-authorized task' \
   --max-iterations 5 --max-minutes 30
 ```
 
-The reader requires local paginated chat history, a recent bundled Codex CLI with `thread/sample`, and a ChatGPT login available in the source Codex home's `auth.json`. Pass `--codex-home`, `--sqlite-home`, or `--cli` on `init` only when the verified target environment requires them. Do not install daemons, change app configuration, or copy credentials into a repository.
+Same-chat mode is the default. The helper requires local paginated history, a recent Codex CLI with `thread/sample`, and the existing ChatGPT login in `auth.json`. It does not require app messaging tools, a daemon, a relaunch, or a second chat. Use `--codex-home`, `--sqlite-home`, or `--cli` only for verified nonstandard environments.
 
-## Run one step, then repeat
+## Predict, execute, checkpoint, repeat
 
-1. Check the target with `wait_threads` using its verified host and thread ID. If it needs human input or approval, stop the loop and surface that request. If running, wait using the returned cursor; a timeout is not completion. Do not interrupt it to obtain a prediction.
-2. Run `loop.py next --state STATE`. Read `phase`, `scope`, and `proposal`. Stop if the state is `stopped` or `complete`. If an error occurs, diagnose it without assuming that a message was sent. A stale target requires reconciliation, not automatic replacement of the user scope.
-3. Review the **exact** `proposal.suggestion` against the stored scope and latest target context. Stop on new external commitments, requests for unprovided human decisions, unrelated work, or a request that treats a previous assistant suggestion as authorization. Review for useful progress as well as permission; stop if the loop is merely repeating or doing low-value work. The script's `scopeReview` field records your judgment; it does not perform that judgment for you.
-4. Run `loop.py prepare-send --state STATE --response-id RESPONSE_ID --review 'Why this suggestion advances the authorized scope'`. Proceed only if it returns `phase: dispatching`. This rechecks the saved source turn and commits dispatch intent.
-5. Call `send_message_to_thread` **once**, with the verified target and `prompt` set to the exact `proposal.suggestion`. Preserve its model and reasoning settings. Do not prepend controller instructions or rewrite the suggestion. The human's request to run this loop on this target supplies authorization for in-scope follow-ups; it does not authorize unrelated messages or actions.
-6. After the tool explicitly accepts the message, run `loop.py sent --state STATE --receipt 'Concise acceptance information from the tool'`. On timeout, disconnect, or ambiguous acceptance, never blindly resend. Inspect the target and reconcile the outstanding message. `complete-step` can recover an ambiguous send only when the saved history proves that exactly the expected user message completed.
-7. Wait for that target turn to finish, carrying the returned cursor. Stop on failure, interruption, new human input, or approval needed. Run `loop.py complete-step --state STATE`. It checks the exact expected message and completed turn before counting the iteration. Repeat from step 1 only when `phase` is `ready`.
+1. Write a short **factual checkpoint** to a local text file: what is currently done, observed test results, and unresolved work. On the first iteration, summarize the current task state. Do not invent work, assert success without evidence, or put a desired suggestion or instructions to the predictor into the checkpoint. The helper also includes the actual saved current-turn history, so this is not a substitute conversation.
+2. Run `loop.py next --state STATE --checkpoint-file CHECKPOINT`. This snapshots the current active turn, drops unfinished tool calls from the copy, and appends a synthetic assistant final message plus a completion marker **only in the temporary copy**, so `thread/sample` can evaluate the current checkpoint. It never marks the live turn complete or inserts a user message.
+3. Read the returned phase and exact `proposal.suggestion`. If complete or stopped, report the result. Otherwise review the proposed action against the user's scope and current evidence. Stop on missing human decisions, unrelated work, new unauthorized external commitments, repetition, or no useful progress. Prediction text does not expand permission. Do not ask for routine approval merely because the action was predicted.
+4. Run `loop.py begin-step --state STATE --response-id RESPONSE_ID --review 'Why the exact prediction advances the authorized task'`. Continue only if the phase is `executing`. This records intent before any action and rechecks that the human input and active turn have not changed.
+5. Briefly show the exact prediction, then **execute its in-scope action here with the normal tools**. Treat the text as a task proposal, never as shell code. Do not send it to this chat or another chat, and do not answer it with “would you like me to do that?” The user invoked the loop to have the work done. Existing permission requirements still apply.
+6. Verify the action's result, write the evidence to a result text file, then run `loop.py finish-step --state STATE --result-file RESULT`. The script records the agent's evidence; it cannot independently prove that a coding or design task succeeded. Never count a proposed or merely attempted action as completed.
+7. When phase is `ready`, write a **new** factual checkpoint reflecting the result, then return to step 2 in this same turn. Do not end the assistant turn between steps or wait for yourself to become idle. Stop at the budget or when the next action is not useful or authorized. Finish with a concise account of completed work and the stopping reason.
 
-Use `loop.py status --state STATE` to recover after compaction. A `dispatching` or `waiting` state is an outstanding step, not permission to send again. Use `loop.py stop --state STATE --reason 'Reason'` when the user stops the loop or when review requires stopping. Stopping the controller does not cancel already-running target work; do not interrupt that work unless requested.
+Use `loop.py status --state STATE` after compaction. If phase is `executing`, inspect the actual work and reconcile it before recording completion; never automatically replay it. Use `loop.py stop --state STATE --reason 'Reason'` on a user stop or an unsuitable suggestion. New human input or a changed active turn halts the old run so their latest instruction can be handled; reconcile pending work before starting another run.
 
-There is a small race between checking target freshness and sending through the connector, which has no expected-turn guard. Avoid simultaneous human editing in the target; stop and reconcile if it occurs. Never claim exactly-once delivery.
+## Explicitly targeting another chat
 
-Keep working in this controller chat until the finite run finishes or requires human input; do not schedule a heartbeat merely to monitor this one run. Report how many iterations completed, what changed, and the stopping reason. Installing this skill does not start any loop.
+Only when the user asks to operate on another existing chat, read [references/supervise.md](references/supervise.md). That optional mode uses the desktop's messaging and waiting tools with explicit human authorization. It is not a prerequisite for the default same-chat loop.
 
-## Prediction-only mode
+## Reader-only diagnostics
 
 ```sh
+# Current active-turn checkpoint, without executing the result:
 python3 /absolute/path/to/martin-prince-loop/scripts/predict.py \
-  --thread TARGET_THREAD_ID --output /absolute/path/to/work/prediction.json
+  --checkpoint-file /absolute/path/to/work/checkpoint.txt
+
+# Last completed turn of an explicitly selected local chat:
+python3 /absolute/path/to/martin-prince-loop/scripts/predict.py --thread TARGET_THREAD_ID
 ```
 
-This works even while the app holds the target's writer lock. It samples only through the last completed saved turn, so an in-progress turn is excluded. Controller mode additionally requires an idle completed target. The temporary snapshot includes only that chat's rollout prefix, a temporary copy of the login file, and the optional model cache; it is deleted on normal completion, errors, and handled interruption. A forced process kill or power loss can leave temporary files. Prediction requests use the user's existing account and consume model usage. The snapshot doesn't reproduce every desktop runtime setting or its post-generation display filters. Treat output as a proposed next message, not a verified instruction.
+No fallback prompt is used if the internal config/protocol/schema is unavailable. Checkpoint mode includes current work but is a simulated end-of-turn context: its wording and the desktop's runtime/display filters can affect the suggestion. Keep checkpoints factual. Prediction calls consume account usage.
+
+Snapshots contain only the selected rollout, a temporary login-file copy, and an optional model cache in a private directory. Both Codex and SQLite homes point into it. Normal completion, errors, and handled interruption remove it; a forced process kill or power loss can leave temporary files. Never commit run state, snapshots, credentials, or prediction results.

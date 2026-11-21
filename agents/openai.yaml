@@ -1,4 +1,4 @@
 interface:
   display_name: "Martin Prince Loop"
-  short_description: "Act on real Codex predictions in a bounded loop"
-  default_prompt: "Use $martin-prince-loop to supervise an existing work chat for up to five in-scope Codex prediction iterations."
+  short_description: "Run real Codex predictions in this chat"
+  default_prompt: "Use $martin-prince-loop to continue the current task here for up to five useful prediction-driven actions."

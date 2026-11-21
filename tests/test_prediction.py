@@ -99,3 +99,55 @@ class HistoryFixture(unittest.TestCase):
         predict.write_json(path, {'phase':'ready'})
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(json.loads(path.read_text()), {'phase':'ready'})
+
+    def active_records(self):
+        records = [
+            {'type':'session_meta','payload':{'id':'target'}},
+            {'type':'event_msg','payload':{'type':'task_started','turn_id':'busy','root_turn_id':'busy'}},
+            {'type':'response_item','payload':{'type':'message','role':'user','content':[{'type':'input_text','text':'Fix the fixture'}]}},
+            {'type':'response_item','payload':{'type':'custom_tool_call','call_id':'finished','input':'inspect'}},
+            {'type':'response_item','payload':{'type':'custom_tool_call_output','call_id':'finished','output':'checked'}},
+            {'type':'response_item','payload':{'type':'custom_tool_call','call_id':'pending','input':'snapshot'}},
+        ]
+        self.rollout.write_text(''.join(json.dumps(r)+'\n' for r in records))
+        return records
+
+    def test_active_checkpoint_keeps_work_and_only_closes_the_copy(self):
+        original = self.active_records()
+        before = self.rollout.read_bytes()
+        with predict.snapshot(self.source, self.scratch, checkpoint='The fixture was inspected.') as (home, copied, turn, _):
+            records = [json.loads(line) for line in copied.read_text().splitlines()]
+            payloads = [r.get('payload',{}) for r in records]
+            self.assertTrue(any(p.get('call_id')=='finished' for p in payloads))
+            self.assertFalse(any(p.get('call_id')=='pending' for p in payloads))
+            self.assertEqual(payloads[-1]['type'], 'task_complete')
+            self.assertEqual(payloads[-1]['turn_id'], 'busy')
+            self.assertEqual(payloads[-2]['content'][0]['text'], 'The fixture was inspected.')
+            self.assertEqual(turn['removedPendingCalls'], 1)
+            self.assertEqual(turn['userFingerprint'], predict.user_fingerprint(original))
+            self.assertEqual(turn['turn'], 'busy')
+        self.assertEqual(self.rollout.read_bytes(), before)
+        self.assertEqual(self.source.latest()['status'], 'inProgress')
+        self.assertFalse(home.exists())
+
+    def test_partial_tail_is_ignored_and_current_turn_must_match(self):
+        self.active_records()
+        with self.rollout.open('ab') as f:f.write(b'{"partial":')
+        with predict.snapshot(self.source, self.scratch, checkpoint='Inspection completed.'):
+            pass
+        records = self.active_records()
+        records[1]['payload']['turn_id']='another-turn'
+        with self.assertRaisesRegex(RuntimeError, 'disagree'):
+            predict.checkpoint_records(records, self.source.latest(), 'Inspection completed.')
+
+    def test_user_fingerprint_ignores_agent_work_but_detects_steering(self):
+        records = self.active_records()
+        baseline = predict.user_fingerprint(records)
+        records.append({'type':'response_item','payload':{'type':'message','role':'assistant','content':[]}})
+        self.assertEqual(predict.user_fingerprint(records), baseline)
+        records.append({'type':'response_item','payload':{'type':'message','role':'user','content':[{'text':'stop'}]}})
+        self.assertNotEqual(predict.user_fingerprint(records), baseline)
+
+    def test_same_chat_defaults_from_environment(self):
+        with patch.dict(os.environ, {'CODEX_THREAD_ID':'current-chat'}):
+            self.assertEqual(predict.Source.resolve(home=self.home, sqlite_home=self.home).thread, 'current-chat')

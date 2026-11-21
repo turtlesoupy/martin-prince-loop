@@ -3,6 +3,8 @@
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -65,10 +67,31 @@ class Source:
     thread: str
 
     @classmethod
-    def resolve(cls, thread, home=None, sqlite_home=None):
+    def resolve(cls, thread=None, home=None, sqlite_home=None):
+        thread = thread or os.environ.get('CODEX_THREAD_ID') or os.environ.get('CODEX_SESSION_ID')
+        if not thread:
+            raise RuntimeError('Current chat ID is unavailable. Supply --thread with a verified ID.')
         home = Path(home or os.environ.get('CODEX_HOME', Path.home() / '.codex')).expanduser().resolve()
         sqlite_home = Path(sqlite_home or os.environ.get('CODEX_SQLITE_HOME', home)).expanduser().resolve()
         return cls(home, sqlite_home, thread)
+
+    def rollout(self):
+        rows = query(database(self.sqlite_home, 'state'),
+            'SELECT rollout_path FROM threads WHERE id=?', (self.thread,))
+        if not rows:
+            raise RuntimeError('Thread metadata was not found.')
+        return Path(rows[0][0])
+
+    def records(self):
+        data = self.rollout().read_bytes()
+        # Ignore a partial trailing record written concurrently by the app.
+        newline = data.rfind(b'\n')
+        if newline < 0:
+            raise RuntimeError('No complete saved rollout records are available.')
+        return [json.loads(line) for line in data[:newline + 1].splitlines()]
+
+    def user_fingerprint(self):
+        return user_fingerprint(self.records())
 
     def latest(self):
         rows = query(database(self.sqlite_home, 'thread_history'),
@@ -91,11 +114,7 @@ class Source:
             if not rows:
                 raise RuntimeError('No completed turn with a saved rollout boundary was found.')
             turn = dict(zip(('turn', 'status', 'end'), rows[0]))
-        rows = query(database(self.sqlite_home, 'state'),
-            'SELECT rollout_path FROM threads WHERE id=?', (self.thread,))
-        if not rows:
-            raise RuntimeError('Thread metadata was not found.')
-        return turn, Path(rows[0][0])
+        return turn, self.rollout()
 
     def continuation(self, source_turn):
         """Return turns after the prediction source and their user messages."""
@@ -168,9 +187,64 @@ def wrapped_prompt(config):
     return config['prompt'] + '\n\nReturn only JSON matching this schema: ' + json.dumps(schema, separators=(',', ':')) + '.'
 
 
+def user_fingerprint(records):
+    # Identify human steering without treating additional assistant/tool work as a new user.
+    messages = [r['payload'] for r in records if r.get('type') == 'response_item'
+        and r.get('payload', {}).get('role') == 'user']
+    return hashlib.sha256(json.dumps(messages, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def checkpoint_records(records, turn, checkpoint):
+    """Close only the copied current turn; never write a synthetic event to the live chat."""
+    starts = [r['payload'] for r in records if r.get('type') == 'event_msg'
+        and r.get('payload', {}).get('type') == 'task_started']
+    if not starts or starts[-1].get('turn_id') != turn['turn']:
+        raise RuntimeError('Saved rollout and current turn disagree; retry at a stable checkpoint.')
+    if turn['status'] != 'inProgress':
+        raise RuntimeError('Same-chat checkpoint mode requires the current active turn.')
+    if any(r.get('type') == 'event_msg' and r.get('payload', {}).get('type') == 'task_complete'
+           and r['payload'].get('turn_id') == turn['turn'] for r in records):
+        raise RuntimeError('The source turn completed during capture; do not apply the active checkpoint.')
+    output_ids = {r['payload'].get('call_id') for r in records if r.get('type') == 'response_item'
+        and r.get('payload', {}).get('type', '').endswith('_call_output')}
+    kept = []
+    removed = 0
+    for record in records:
+        item = record.get('payload', {})
+        if (record.get('type') == 'response_item' and item.get('call_id')
+                and item.get('type', '').endswith('_call') and item['call_id'] not in output_ids):
+            removed += 1
+            continue
+        kept.append(record)
+    stamp = datetime.now(timezone.utc).isoformat()
+    ordinal = max(r.get('ordinal', 0) for r in records) + 1
+    kept.append({'timestamp': stamp, 'ordinal': ordinal, 'type': 'response_item', 'payload': {
+        'type': 'message', 'role': 'assistant', 'phase': 'final_answer', 'status': 'completed',
+        'content': [{'type': 'output_text', 'text': checkpoint}]}})
+    kept.append({'timestamp': stamp, 'ordinal': ordinal + 1, 'type': 'event_msg', 'payload': {
+        'type': 'task_complete', 'root_turn_id': starts[-1].get('root_turn_id', turn['turn']),
+        'turn_id': turn['turn'], 'last_agent_message': checkpoint, 'completed_at': int(time.time())}})
+    return kept, removed
+
+
 @contextmanager
-def snapshot(source, scratch=None, idle=False):
-    turn, rollout = source.boundary(idle=idle)
+def snapshot(source, scratch=None, idle=False, checkpoint=None):
+    if checkpoint is not None:
+        if idle or not isinstance(checkpoint, str) or not checkpoint.strip():
+            raise ValueError('Provide a nonempty checkpoint for same-chat mode; do not combine it with require-idle.')
+        turn, rollout = source.latest(), source.rollout()
+        original = source.records()
+        records, removed = checkpoint_records(original, turn, checkpoint)
+        turn = {**turn, 'status': 'completed', 'snapshotMode': 'active-checkpoint',
+            'userFingerprint': user_fingerprint(original), 'removedPendingCalls': removed,
+            'checkpointDigest': hashlib.sha256(checkpoint.encode()).hexdigest()}
+        data = ''.join(json.dumps(r) + '\n' for r in records).encode()
+    else:
+        turn, rollout = source.boundary(idle=idle)
+        with rollout.open('rb') as stream:
+            data = stream.read(turn['end'])
+        if len(data) != turn['end'] or not data.endswith(b'\n'):
+            raise RuntimeError('Snapshot boundary is not a complete saved record.')
     if scratch:
         Path(scratch).mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='martin-prince-', dir=scratch) as directory:
@@ -178,10 +252,6 @@ def snapshot(source, scratch=None, idle=False):
         os.chmod(home, 0o700)
         copied = home / 'sessions' / rollout.name
         copied.parent.mkdir()
-        with rollout.open('rb') as stream:
-            data = stream.read(turn['end'])
-        if len(data) != turn['end'] or not data.endswith(b'\n'):
-            raise RuntimeError('Snapshot boundary is not a complete saved record.')
         copied.write_bytes(data)
         for name in ('auth.json', 'models_cache.json'):
             if (source.home / name).exists():
@@ -250,13 +320,13 @@ class RPC:
             stream.close()
 
 
-def predict(source, cli=None, scratch=None, idle=False):
+def predict(source, cli=None, scratch=None, idle=False, checkpoint=None):
     config = configuration(source.home)
     executable = find_cli(cli)
-    with snapshot(source, scratch=scratch, idle=idle) as (_, copied, turn, env):
+    with snapshot(source, scratch=scratch, idle=idle, checkpoint=checkpoint) as (_, copied, turn, env):
         rpc = RPC(executable, env)
         try:
-            rpc.call('initialize', {'clientInfo': {'name': 'martin_prince_loop', 'version': '0.1.0'},
+            rpc.call('initialize', {'clientInfo': {'name': 'martin_prince_loop', 'version': '0.2.0'},
                 'capabilities': {'experimentalApi': True}})
             rpc.send({'method': 'initialized'})
             loaded = rpc.call('thread/resume', {'threadId': source.thread, 'path': str(copied)})['thread']
@@ -281,14 +351,17 @@ def predict(source, cli=None, scratch=None, idle=False):
     if suggestion is not None and (not isinstance(suggestion, str) or not suggestion.strip()):
         raise RuntimeError('Invalid suggestion format.')
     return {'threadId': source.thread, 'sourceTurnId': turn['turn'], 'promptVersion': config.get('prompt_version'),
-        'method': 'thread/sample', 'context': 'isolated completed-turn snapshot', 'suggestion': suggestion,
+        'method': 'thread/sample', 'context': 'isolated active-turn checkpoint' if checkpoint is not None else 'isolated completed-turn snapshot',
+        **{key: turn[key] for key in ('userFingerprint', 'checkpointDigest', 'removedPendingCalls') if key in turn},
+        'suggestion': suggestion,
         'responseId': result.get('responseId'),
         'usage': {key: result.get(key) for key in ('inputTokens', 'cachedInputTokens', 'outputTokens')}}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--thread', required=True)
+    parser.add_argument('--thread', help='Defaults to the current Codex chat environment.')
+    parser.add_argument('--checkpoint-file', help='Factual assistant checkpoint for the current active turn.')
     parser.add_argument('--codex-home')
     parser.add_argument('--sqlite-home')
     parser.add_argument('--cli')
@@ -301,7 +374,8 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     try:
         result = predict(Source.resolve(args.thread, args.codex_home, args.sqlite_home),
-            cli=args.cli, scratch=args.scratch, idle=args.require_idle)
+            cli=args.cli, scratch=args.scratch, idle=args.require_idle,
+            checkpoint=Path(args.checkpoint_file).read_text() if args.checkpoint_file else None)
         if args.output:
             write_json(args.output, result)
         print(json.dumps(result, indent=2))
