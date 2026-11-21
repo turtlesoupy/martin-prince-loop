@@ -13,7 +13,9 @@ import signal
 import subprocess
 import time
 
-from predict import Source, find_cli, predict, write_json
+from predict import DEFAULT_TIMEOUT, Source, TransientError, find_cli, predict, write_json
+
+sleep = time.sleep  # Replaced in tests.
 
 
 def now():
@@ -52,14 +54,38 @@ def fresh(state, source):
     return latest['status'] == 'completed' and latest['turn'] == state['proposal']['sourceTurnId']
 
 
-def queue_message(state, text):
+def setting(state, args, name, default):
+    value = getattr(args, name, None)
+    return value if value is not None else state.get(name, default)
+
+
+def sample(state, args, source, predictor, **kwargs):
+    """Sample a prediction, retrying transient failures up to the run's retry limit."""
+    timeout = setting(state, args, 'timeout', DEFAULT_TIMEOUT)
+    retries = setting(state, args, 'retries', 0)
+    for attempt in range(retries + 1):
+        try:
+            return predictor(source, cli=state['cli'], scratch=state['scratch'], timeout=timeout, **kwargs)
+        except TransientError as exc:
+            delay = min(2 ** attempt, 30)
+            if attempt == retries or time.time() + delay >= state['deadline']:
+                raise RuntimeError(f'Prediction failed after {attempt + 1} attempt(s): {exc}') from exc
+            state.setdefault('retryLog', []).append({'at': now(), 'attempt': attempt + 1, 'error': str(exc)})
+            sleep(delay)
+
+
+def queue_message(state, text, timeout):
     """Queue text as a real user message with the Codex CLI. Never goes through a shell."""
-    result = subprocess.run([find_cli(state['cli']), 'queue', '--thread', state['threadId'], '--message', text],
-        capture_output=True, text=True, timeout=60)
+    command = [find_cli(state['cli']), 'queue', '--thread', state['threadId'], '--message', text]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f'codex queue timed out after {timeout:g}s. The message may still be queued; '
+            'check before running send --retry.') from exc
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise RuntimeError(f'codex queue exited {result.returncode}: {detail}. The message may still be queued; '
-            'reconcile with resume-message before retrying.')
+            'check before running send --retry.')
     return result.stdout.strip() or 'codex queue exited 0'
 
 
@@ -87,7 +113,7 @@ def operate_same_chat(state, command, args, source, predictor):
         digest = hashlib.sha256(checkpoint.encode()).hexdigest()
         if state['history'] and digest == state['history'][-1]['checkpointDigest']:
             return halt(state, 'Unchanged checkpoint; do not predict repeatedly from the same work summary.')
-        proposal = predictor(source, cli=state['cli'], scratch=state['scratch'], checkpoint=checkpoint)
+        proposal = sample(state, args, source, predictor, checkpoint=checkpoint)
         state['proposal'] = proposal
         if (not same_context(state, source) or proposal.get('sourceTurnId') != state['originTurnId']
                 or proposal.get('userFingerprint') != state['userFingerprint']):
@@ -126,7 +152,7 @@ def operate_same_chat(state, command, args, source, predictor):
     return state
 
 
-def operate_messages(state, command, args, source, predictor, sender):
+def operate_messages(state, command, args, source, predictor, sender, persist):
     """Queue exact predictions with codex queue; resume only observed messages."""
     if command == 'resume-message':
         if state['phase'] not in ('dispatching', 'waiting'):
@@ -154,8 +180,19 @@ def operate_messages(state, command, args, source, predictor, sender):
     if command in ('send', 'sent'):
         if state['phase'] != 'dispatching':
             raise RuntimeError('No prepared message; do not send another.')
-        # 'send' queues the message itself; 'sent' records a send done by hand.
-        receipt = sender(state, state['proposal']['suggestion']) if command == 'send' else args.receipt
+        proposal = state['proposal']
+        if command == 'send':
+            if proposal.get('sendAttempts') and not getattr(args, 'retry', False):
+                raise RuntimeError('A previous send attempt may already have queued this message. Check the queue '
+                    'and chat history, then use resume-message if it arrived or send --retry if it did not.')
+            if any(proposal['suggestion'].strip() in turn['messages']
+                   for turn in source.continuation(proposal['sourceTurnId'])):
+                raise RuntimeError('This message already arrived; run resume-message instead of sending again.')
+            proposal['sendAttempts'] = proposal.get('sendAttempts', 0) + 1
+            persist(state)  # Record the attempt before anything can be queued.
+            receipt = sender(state, proposal['suggestion'], setting(state, args, 'timeout', DEFAULT_TIMEOUT))
+        else:
+            receipt = args.receipt  # A send done by hand.
         if not receipt.strip():
             raise RuntimeError('A queue receipt is required.')
         state['proposal']['receipt'] = receipt
@@ -184,7 +221,7 @@ def operate_supervise(state, command, args, source, predictor):
             raise RuntimeError('Wait until the target completes successfully before requesting another prediction.')
         if state['history'] and latest['turn'] != state['history'][-1]['completedTurnId']:
             return halt(state, 'Intervening work changed the target; ask the user to resume explicitly.')
-        proposal = predictor(source, cli=state['cli'], scratch=state['scratch'], idle=True)
+        proposal = sample(state, args, source, predictor, idle=True)
         state['proposal'] = proposal
         if proposal['sourceTurnId'] != latest['turn'] or not fresh(state, source):
             return halt(state, 'Target changed during prediction generation.')
@@ -238,7 +275,7 @@ def operate_supervise(state, command, args, source, predictor):
     return state
 
 
-def operate(state, command, args, source=None, predictor=predict, sender=queue_message):
+def operate(state, command, args, source=None, predictor=predict, sender=queue_message, persist=lambda state: None):
     """Advance the run state. Only 'send' talks to Codex, and never through a shell."""
     state['updatedAt'] = now()
     if command == 'status':
@@ -251,7 +288,7 @@ def operate(state, command, args, source=None, predictor=predict, sender=queue_m
         return halt(state, 'Time budget reached.')
     source = source or source_for(state)
     if state['mode'] == 'chat-messages':
-        return operate_messages(state, command, args, source, predictor, sender)
+        return operate_messages(state, command, args, source, predictor, sender, persist)
     if state['mode'] == 'same-chat':
         return operate_same_chat(state, command, args, source, predictor)
     return operate_supervise(state, command, args, source, predictor)
@@ -271,11 +308,20 @@ def main():
     init.add_argument('--sqlite-home')
     init.add_argument('--cli')
     init.add_argument('--scratch')
+    init.add_argument('--timeout', type=float, default=DEFAULT_TIMEOUT,
+        help='Seconds to wait on each prediction request or codex queue call.')
+    init.add_argument('--retries', type=int, default=0, help='Extra attempts after a transient prediction failure.')
     for name in ('next', 'begin-step', 'finish-step', 'prepare-send', 'send', 'sent', 'complete-step', 'resume-message', 'status', 'stop'):
         cmd = sub.add_parser(name)
         cmd.add_argument('--state', required=True)
+        if name in ('next', 'send'):
+            cmd.add_argument('--timeout', type=float, help="Override the run's timeout for this call.")
         if name == 'next':
             cmd.add_argument('--checkpoint-file')
+            cmd.add_argument('--retries', type=int, help="Override the run's retry limit for this call.")
+        elif name == 'send':
+            cmd.add_argument('--retry', action='store_true',
+                help='Send again after a failed attempt, once you have confirmed it was not queued.')
         elif name in ('prepare-send', 'begin-step'):
             cmd.add_argument('--response-id', required=True)
             cmd.add_argument('--review', required=True)
@@ -296,6 +342,8 @@ def main():
                     raise RuntimeError('State file already exists; it will not be overwritten.')
                 if args.max_iterations < 1 or not math.isfinite(args.max_minutes) or args.max_minutes <= 0 or not args.scope.strip():
                     raise ValueError('Scope and positive iteration/time limits are required.')
+                if not math.isfinite(args.timeout) or args.timeout <= 0 or args.retries < 0:
+                    raise ValueError('Timeout must be positive and retries cannot be negative.')
                 source = Source.resolve(args.thread, args.codex_home, args.sqlite_home)
                 latest = source.latest()
                 if args.mode in ('same-chat', 'chat-messages') and latest['status'] != 'inProgress':
@@ -304,7 +352,8 @@ def main():
                     'maxIterations': args.max_iterations, 'completedIterations': 0,
                     'deadline': time.time() + args.max_minutes * 60, 'createdAt': now(), 'updatedAt': now(),
                     'codexHome': str(source.home), 'sqliteHome': str(source.sqlite_home), 'cli': args.cli,
-                    'scratch': args.scratch, 'phase': 'ready', 'history': []}
+                    'scratch': args.scratch, 'timeout': args.timeout, 'retries': args.retries,
+                    'phase': 'ready', 'history': []}
                 if args.mode in ('same-chat', 'chat-messages'):
                     state['originTurnId'] = latest['turn']
                     state['userFingerprint'] = source.user_fingerprint()
@@ -312,7 +361,7 @@ def main():
                 state = json.loads(path.read_text())
                 if state.get('version') != 2:
                     raise RuntimeError('Unsupported controller state version.')
-                state = operate(state, args.command, args)
+                state = operate(state, args.command, args, persist=lambda current: write_json(path, current))
             if args.command != 'status':
                 write_json(path, state)
             print(json.dumps(state, indent=2))

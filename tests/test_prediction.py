@@ -75,7 +75,7 @@ class HistoryFixture(unittest.TestCase):
                 self.home = Path(env['CODEX_HOME'])
             def send(self, data): pass
             def close(self): calls.append(('closed', self.home))
-            def call(self, method, params):
+            def call(self, method, params, timeout=None):
                 calls.append((method, params))
                 if method == 'thread/resume':
                     return {'thread': {'turns': [{'id':'done','status':'completed'}]}}

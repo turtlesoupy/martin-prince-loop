@@ -21,6 +21,11 @@ import urllib.error
 import urllib.request
 
 CONFIG_URL = 'https://chatgpt.com/backend-api/wham/predictions/config'
+DEFAULT_TIMEOUT = 90
+
+
+class TransientError(RuntimeError):
+    """A failure that may succeed if the prediction is sampled again."""
 
 
 def write_json(path, value):
@@ -175,9 +180,10 @@ def configuration(home):
         with urllib.request.build_opener(NoRedirect()).open(request, timeout=20) as response:
             config = json.load(response)
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f'Prediction configuration request returned HTTP {exc.code}; no fallback prompt was used.') from exc
+        error = TransientError if exc.code == 429 or exc.code >= 500 else RuntimeError
+        raise error(f'Prediction configuration request returned HTTP {exc.code}; no fallback prompt was used.') from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f'Could not reach the prediction configuration endpoint: {exc.reason}') from exc
+        raise TransientError(f'Could not reach the prediction configuration endpoint: {exc.reason}') from exc
     if not config.get('is_enabled') or not isinstance(config.get('prompt'), str) or not config['prompt']:
         raise RuntimeError('The live prediction prompt is disabled or unavailable; no fallback prompt was used.')
     return config
@@ -201,7 +207,7 @@ def checkpoint_records(records, turn, checkpoint):
     starts = [r['payload'] for r in records if r.get('type') == 'event_msg'
         and r.get('payload', {}).get('type') == 'task_started']
     if not starts or starts[-1].get('turn_id') != turn['turn']:
-        raise RuntimeError('Saved rollout and current turn disagree; retry at a stable checkpoint.')
+        raise TransientError('Saved rollout and current turn disagree; retry at a stable checkpoint.')
     if turn['status'] != 'inProgress':
         raise RuntimeError('Same-chat checkpoint mode requires the current active turn.')
     if any(r.get('type') == 'event_msg' and r.get('payload', {}).get('type') == 'task_complete'
@@ -278,7 +284,7 @@ class RPC:
             except Exception as exc:
                 self.messages.put(exc)
             finally:
-                self.messages.put(EOFError('App server exited.'))
+                self.messages.put(TransientError('App server exited.'))
         self.reader = threading.Thread(target=read, daemon=True)
         self.reader.start()
 
@@ -286,7 +292,7 @@ class RPC:
         self.process.stdin.write(json.dumps(data) + '\n')
         self.process.stdin.flush()
 
-    def call(self, method, params, timeout=90):
+    def call(self, method, params, timeout=DEFAULT_TIMEOUT):
         self.request_id += 1
         request_id = self.request_id
         self.send({'id': request_id, 'method': method, 'params': params})
@@ -295,7 +301,7 @@ class RPC:
             try:
                 message = self.messages.get(timeout=max(0, deadline - time.monotonic()))
             except queue.Empty as exc:
-                raise TimeoutError(f'{method} timed out.') from exc
+                raise TransientError(f'{method} timed out after {timeout:g}s.') from exc
             if isinstance(message, Exception):
                 raise message
             if 'method' in message and 'id' in message:
@@ -325,16 +331,16 @@ class RPC:
             stream.close()
 
 
-def predict(source, cli=None, scratch=None, idle=False, checkpoint=None):
+def predict(source, cli=None, scratch=None, idle=False, checkpoint=None, timeout=DEFAULT_TIMEOUT):
     config = configuration(source.home)
     executable = find_cli(cli)
     with snapshot(source, scratch=scratch, idle=idle, checkpoint=checkpoint) as (_, copied, turn, env):
         rpc = RPC(executable, env)
         try:
             rpc.call('initialize', {'clientInfo': {'name': 'martin_prince_loop', 'version': '0.2.0'},
-                'capabilities': {'experimentalApi': True}})
+                'capabilities': {'experimentalApi': True}}, timeout=timeout)
             rpc.send({'method': 'initialized'})
-            loaded = rpc.call('thread/resume', {'threadId': source.thread, 'path': str(copied)})['thread']
+            loaded = rpc.call('thread/resume', {'threadId': source.thread, 'path': str(copied)}, timeout=timeout)['thread']
             turns = loaded.get('turns', [])
             if not turns or turns[-1]['id'] != turn['turn'] or turns[-1]['status'] != 'completed':
                 raise RuntimeError('Snapshot did not end at the expected completed turn.')
@@ -342,7 +348,7 @@ def predict(source, cli=None, scratch=None, idle=False, checkpoint=None):
                 'prompt': wrapped_prompt(config), 'effort': config.get('prediction_reasoning_effort'),
                 'threadSource': 'composer_predictions', 'turnTrigger': 'composer_predictions',
                 'responsesapiClientMetadata': {'prediction_source_thread_id': source.thread,
-                    'prediction_source_turn_id': turn['turn'], 'prediction_trigger': 'catch_up'}, 'disableMcp': True})
+                    'prediction_source_turn_id': turn['turn'], 'prediction_trigger': 'catch_up'}, 'disableMcp': True}, timeout=timeout)
         finally:
             rpc.close()
     if result.get('sourceTurnId') != turn['turn']:
@@ -372,6 +378,7 @@ def main():
     parser.add_argument('--cli')
     parser.add_argument('--scratch')
     parser.add_argument('--require-idle', action='store_true')
+    parser.add_argument('--timeout', type=float, default=DEFAULT_TIMEOUT, help='Seconds per app-server request.')
     parser.add_argument('--output')
     args = parser.parse_args()
     def interrupted(*_):
@@ -379,7 +386,7 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     try:
         result = predict(Source.resolve(args.thread, args.codex_home, args.sqlite_home),
-            cli=args.cli, scratch=args.scratch, idle=args.require_idle,
+            cli=args.cli, scratch=args.scratch, idle=args.require_idle, timeout=args.timeout,
             checkpoint=Path(args.checkpoint_file).read_text() if args.checkpoint_file else None)
         if args.output:
             write_json(args.output, result)
