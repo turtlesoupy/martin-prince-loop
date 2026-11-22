@@ -53,7 +53,7 @@ The full live chat remains authoritative for permissions and human steering. Une
 
 - `loop.py status --state STATE` returns state, timing, and errors. The private `STATE` basename plus `.worker.log` holds worker diagnostics. Do not poll during normal replies.
 - `loop.py stop --state STATE --reason REASON` stops future sampling/dispatch; an already queued message may still arrive.
-- A `dispatching` state or send timeout can mean the message was queued. Inspect saved queue/chat history before any recovery. If it arrived, use `resume-message`; do not send a duplicate. A dead worker or unresolved send must be reported, not hidden behind a new run. After reconciling existing state, `python3 scripts/worker.py --state STATE` can resume worker supervision without changing the budget.
+- A `dispatching` state or send timeout can mean the message was queued. Inspect saved queue/chat history before any recovery. If it arrived, use `resume-message`; do not send a duplicate. `resume-message` restarts a dead worker by itself when predictions remain, and `status` reports `workerAlive` and any `workerRestarts`. An unresolved send must be reported, not hidden behind a new run. `python3 scripts/worker.py --state STATE` restarts the worker by hand without changing the budget.
 - `predict.py --thread THREAD --before-turn INVOCATION_TURN --require-idle` is a read-only diagnostic of the pre-invocation conversation. It never queues messages or extends a run.
 
 The background worker exits on completion, stop, deadline, or failure. It is a local process, not a scheduled automation, and does not relaunch the app. App/CLI support for idle `codex queue` consumption is required; if a message remains queued, report that observed limitation rather than double-sending.

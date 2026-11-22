@@ -27,6 +27,27 @@ def launch(state_path):
     return process.pid
 
 
+def alive(state_path):
+    """True while a worker holds this run's worker lock."""
+    try:
+        with locked(str(Path(state_path).resolve()) + '.worker'):
+            return False
+    except LockBusy:
+        return True
+
+
+def ensure(state_path, state, launcher=launch):
+    """Restart the worker if it died while the run still has predictions to make."""
+    if state['phase'] != 'ready' or alive(state_path):
+        return False
+    restart = {'at': now(), 'previousPid': state.get('workerPid')}
+    if 'workerError' in state:
+        restart['previousError'] = state.pop('workerError')
+    state['workerPid'] = launcher(state_path)
+    state.setdefault('workerRestarts', []).append(restart)
+    return True
+
+
 def current(state, source):
     latest = source.latest()
     return (latest['turn'] == state['originTurnId'] and latest['status'] == 'completed'

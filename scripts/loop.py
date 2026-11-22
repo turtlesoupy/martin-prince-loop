@@ -179,10 +179,15 @@ def main():
                 if state.get('version') != 2 or state.get('mode') != 'background':
                     raise RuntimeError('This run was created by an older version of the skill; start a new run.')
                 state = operate(state, args.command, args)
+                if args.command == 'resume-message':
+                    # A worker that died mid-send would otherwise stall the loop silently.
+                    from worker import ensure
+                    ensure(path, state)
                 if args.command != 'status':
                     write_json(path, state)
             if args.command == 'status':
-                print(json.dumps(state, indent=2))
+                from worker import alive
+                print(json.dumps({**state, 'workerAlive': alive(path)}, indent=2))
                 return
             if state['phase'] == 'stopped':
                 instruction = 'Stopped. Do not continue the loop.'

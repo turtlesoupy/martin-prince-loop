@@ -229,3 +229,26 @@ class WorkerTests(unittest.TestCase):
                     time.sleep(0.1)
         finally:
             state=json.loads(path.read_text());loop.halt(state,'test cleanup');predict.write_json(path,state)
+
+    def test_dead_worker_is_restarted_once_work_remains(self):
+        self.state['workerPid'] = 111
+        self.state['workerError'] = 'codex queue timed out'
+        launched = []
+        def launcher(path):
+            launched.append(path); return 222
+        self.assertFalse(worker.alive(self.path))
+        self.assertTrue(worker.ensure(self.path, self.state, launcher))
+        self.assertEqual(self.state['workerPid'], 222)
+        self.assertNotIn('workerError', self.state)
+        self.assertEqual(self.state['workerRestarts'][0]['previousError'], 'codex queue timed out')
+        self.assertEqual(self.state['workerRestarts'][0]['previousPid'], 111)
+        self.assertEqual(len(launched), 1)
+
+    def test_live_or_finished_runs_are_not_restarted(self):
+        def launcher(path): self.fail('Must not launch a second worker')
+        with loop.locked(str(self.path) + '.worker'):
+            self.assertTrue(worker.alive(self.path))
+            self.assertFalse(worker.ensure(self.path, self.state, launcher))
+        for phase in ('complete', 'stopped', 'waiting', 'dispatching'):
+            self.state['phase'] = phase
+            self.assertFalse(worker.ensure(self.path, self.state, launcher))
