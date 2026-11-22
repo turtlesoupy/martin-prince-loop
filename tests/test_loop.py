@@ -3,6 +3,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
@@ -69,3 +70,25 @@ class LockTests(unittest.TestCase):
     def test_controller_waits_out_a_brief_holder(self):
         self.hold(0.3)
         with loop.locked(self.path, wait=5): pass
+
+
+class LateDeliveryTests(unittest.TestCase):
+    def setUp(self):
+        self.state = {'phase': 'stopped', 'stopReason': 'Time budget reached.', 'completedIterations': 1,
+            'maxIterations': 5, 'history': [], 'proposal': {'sourceTurnId': 'source', 'suggestion': 'Run the checks'}}
+
+    def resume(self, messages):
+        source = SimpleNamespace(continuation=lambda turn: [{'turn': 'late', 'status': 'inProgress', 'messages': messages}])
+        return loop.operate(self.state, 'resume-message', SimpleNamespace(), source=source)
+
+    def test_message_queued_before_the_stop_is_accepted_without_restarting(self):
+        self.resume(['Run the checks'])
+        self.assertEqual(self.state['phase'], 'stopped')
+        self.assertEqual(self.state['completedIterations'], 2)
+        self.assertEqual(self.state['history'][0]['deliveredTurnId'], 'late')
+        self.assertTrue(self.state['lateDelivery'])
+        self.assertNotIn('proposal', self.state)
+
+    def test_other_input_after_the_stop_is_still_refused(self):
+        with self.assertRaisesRegex(RuntimeError, 'ended'): self.resume(['Something the user typed'])
+        self.assertEqual(self.state['completedIterations'], 1)

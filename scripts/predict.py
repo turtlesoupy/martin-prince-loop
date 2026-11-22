@@ -15,6 +15,7 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -97,7 +98,7 @@ class Source:
         return [json.loads(line) for line in data[:newline + 1].splitlines()]
 
     def user_fingerprint(self):
-        return user_fingerprint(self.records())
+        return fingerprint(user_messages(self.rollout()))
 
     def latest(self):
         rows = query(database(self.sqlite_home, 'thread_history'),
@@ -196,11 +197,51 @@ def wrapped_prompt(config):
     return config['prompt'] + '\n\nReturn only JSON matching this schema: ' + json.dumps(schema, separators=(',', ':')) + '.'
 
 
+def is_user(record):
+    return record.get('type') == 'response_item' and record.get('payload', {}).get('role') == 'user'
+
+
+def fingerprint(messages):
+    return hashlib.sha256(json.dumps(messages, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
 def user_fingerprint(records):
     # Identify human steering without treating additional assistant/tool work as a new user.
-    messages = [r['payload'] for r in records if r.get('type') == 'response_item'
-        and r.get('payload', {}).get('role') == 'user']
-    return hashlib.sha256(json.dumps(messages, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return fingerprint([r['payload'] for r in records if is_user(r)])
+
+
+_tails = {}  # rollout path -> (inode, offset, last bytes before offset, user messages so far)
+
+
+def user_messages(rollout):
+    """User messages in a rollout, reading only what was appended since the last call.
+
+    The worker asks twice a second, so re-reading a long chat each time is wasteful.
+    Anything other than a plain append falls back to a full read.
+    """
+    key = str(rollout)
+    with open(rollout, 'rb') as stream:
+        inode = os.fstat(stream.fileno()).st_ino
+        cached = _tails.get(key)
+        offset, messages = 0, []
+        if cached and cached[0] == inode:
+            stream.seek(max(0, cached[1] - len(cached[2])))
+            if stream.read(len(cached[2])) == cached[2]:
+                offset, messages = cached[1], list(cached[3])
+        stream.seek(offset)
+        data = stream.read()
+        # Ignore a partial trailing record written concurrently by the app.
+        data = data[:data.rfind(b'\n') + 1]
+        if offset == 0 and not data:
+            raise RuntimeError('No complete saved rollout records are available.')
+        for line in data.splitlines():
+            record = json.loads(line)
+            if is_user(record):
+                messages.append(record['payload'])
+        stream.seek(max(0, offset + len(data) - 64))
+        tail = stream.read(min(64, offset + len(data)))
+    _tails[key] = (inode, offset + len(data), tail, messages)
+    return messages
 
 
 def completed_conversation(original, context, turn, thread):
@@ -335,6 +376,13 @@ class RPC:
             stream.close()
 
 
+def auth_differs(source_home, snapshot_home):
+    try:
+        return (source_home / 'auth.json').read_bytes() != (snapshot_home / 'auth.json').read_bytes()
+    except OSError:
+        return False
+
+
 def predict(source, cli=None, scratch=None, idle=False, timeout=DEFAULT_TIMEOUT, loop_context=None, completed_context=False):
     config = configuration(source.home)
     executable = find_cli(cli)
@@ -355,6 +403,12 @@ def predict(source, cli=None, scratch=None, idle=False, timeout=DEFAULT_TIMEOUT,
                     'prediction_source_turn_id': turn['turn'], 'prediction_trigger': 'catch_up'}, 'disableMcp': True}, timeout=timeout)
         finally:
             rpc.close()
+            auth_changed = auth_differs(source.home, Path(env['CODEX_HOME']))
+    if auth_changed:
+        # The copy is about to be deleted. If the login was refreshed there and
+        # refresh tokens rotate, the real install may be left with a revoked one.
+        print('Warning: Codex rewrote auth.json inside the temporary snapshot; '
+            'the real login may need to be renewed.', file=sys.stderr, flush=True)
     if result.get('sourceTurnId') != turn['turn']:
         raise RuntimeError('Prediction returned a different source turn.')
     if result.get('text') is None:
@@ -369,6 +423,7 @@ def predict(source, cli=None, scratch=None, idle=False, timeout=DEFAULT_TIMEOUT,
         'method': 'thread/sample', 'context': 'conversation without loop administration' if loop_context is not None else 'isolated completed-turn snapshot',
         **{key: turn[key] for key in ('userFingerprint', 'conversationDigest') if key in turn},
         'suggestion': suggestion,
+        'authChangedInSnapshot': auth_changed,
         'responseId': result.get('responseId'),
         'usage': {key: result.get(key) for key in ('inputTokens', 'cachedInputTokens', 'outputTokens')}}
 

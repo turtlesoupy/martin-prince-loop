@@ -52,7 +52,8 @@ The full live chat remains authoritative for permissions and human steering. Une
 ## Diagnostics and recovery
 
 - `loop.py status --state STATE` returns state, timing, and errors. The private `STATE` basename plus `.worker.log` holds worker diagnostics. Do not poll during normal replies.
-- `loop.py stop --state STATE --reason REASON` stops future sampling/dispatch; an already queued message may still arrive.
+- `loop.py stop --state STATE --reason REASON` stops future sampling/dispatch; an already queued message may still arrive. If one does, `resume-message` still verifies it and says to answer it; the run stays stopped.
+- If the worker log or a prediction's `authChangedInSnapshot` shows that Codex rewrote `auth.json` inside the temporary snapshot, tell the user: their real login may need to be renewed.
 - A `dispatching` state or send timeout can mean the message was queued. Inspect saved queue/chat history before any recovery. If it arrived, use `resume-message`; do not send a duplicate. `resume-message` restarts a dead worker by itself when predictions remain, and `status` reports `workerAlive` and any `workerRestarts`. An unresolved send must be reported, not hidden behind a new run. `python3 scripts/worker.py --state STATE` restarts the worker by hand without changing the budget.
 - `predict.py --thread THREAD --before-turn INVOCATION_TURN --require-idle` is a read-only diagnostic of the pre-invocation conversation. It never queues messages or extends a run.
 

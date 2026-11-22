@@ -96,6 +96,16 @@ def operate(state, command, args, source=None):
         return state
     if command == 'stop':
         return halt(state, args.reason)
+    if command == 'resume-message' and state['phase'] == 'stopped' and 'proposal' in state:
+        # The run stopped (deadline or stop) with a message already queued, and it has now arrived.
+        source = source or source_for(state)
+        following = source.continuation(state['proposal']['sourceTurnId'])
+        if len(following) == 1 and following[0]['messages'] == [state['proposal']['suggestion'].strip()]:
+            state['proposal']['deliveredTurnId'] = following[0]['turn']
+            state['history'].append(state.pop('proposal'))
+            state['completedIterations'] += 1
+            state['lateDelivery'] = True
+            return state
     if state['phase'] in ('stopped', 'complete'):
         raise RuntimeError('This run has ended; create a new state file for a new authorized run.')
     if command != 'resume-message':
@@ -166,6 +176,7 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     try:
         with locked(args.state, wait=10) as path:
+            late = False
             if args.command == 'start':
                 if path.exists():
                     raise RuntimeError('State file already exists; it will not be overwritten.')
@@ -179,6 +190,7 @@ def main():
                 if state.get('version') != 2 or state.get('mode') != 'background':
                     raise RuntimeError('This run was created by an older version of the skill; start a new run.')
                 state = operate(state, args.command, args)
+                late = state.pop('lateDelivery', False)
                 if args.command == 'resume-message':
                     # A worker that died mid-send would otherwise stall the loop silently.
                     from worker import ensure
@@ -189,7 +201,10 @@ def main():
                 from worker import alive
                 print(json.dumps({**state, 'workerAlive': alive(path)}, indent=2))
                 return
-            if state['phase'] == 'stopped':
+            if late:
+                instruction = ('The run already stopped, but this message was queued before that. Review it against '
+                    'the original scope and answer it normally; nothing more will be queued.')
+            elif state['phase'] == 'stopped':
                 instruction = 'Stopped. Do not continue the loop.'
             elif args.command == 'start':
                 instruction = 'End this invocation turn now. The background worker waits for the final reply.'

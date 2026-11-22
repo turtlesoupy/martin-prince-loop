@@ -123,3 +123,38 @@ class HistoryFixture(unittest.TestCase):
     def test_thread_defaults_from_environment(self):
         with patch.dict(os.environ, {'CODEX_THREAD_ID':'current-chat'}):
             self.assertEqual(predict.Source.resolve(home=self.home, sqlite_home=self.home).thread, 'current-chat')
+
+    def test_fingerprint_reads_only_appended_records_and_matches_a_full_read(self):
+        records = self.active_records()
+        self.assertEqual(self.source.user_fingerprint(), predict.user_fingerprint(records))
+        offset = predict._tails[str(self.rollout)][1]
+        self.assertEqual(offset, self.rollout.stat().st_size)
+        extra = {'type':'response_item','payload':{'type':'message','role':'user','content':[{'text':'stop'}]}}
+        with self.rollout.open('a') as f: f.write(json.dumps(extra) + '\n{"partial":')
+        self.assertEqual(self.source.user_fingerprint(), predict.user_fingerprint(records + [extra]))
+
+    def test_fingerprint_rereads_a_rewritten_rollout(self):
+        records = self.active_records()
+        self.source.user_fingerprint()
+        records[2]['payload']['content'][0]['text'] = 'Fix something else entirely'
+        self.rollout.write_text(''.join(json.dumps(r)+'\n' for r in records))
+        self.assertEqual(self.source.user_fingerprint(), predict.user_fingerprint(records))
+
+    def test_predict_reports_a_login_rewritten_inside_the_snapshot(self):
+        class RefreshingRPC:
+            def __init__(self, executable, env):
+                (Path(env['CODEX_HOME']) / 'auth.json').write_text('{"tokens":{"access_token":"rotated"}}')
+            def send(self, data): pass
+            def close(self): pass
+            def call(self, method, params, timeout=None):
+                if method == 'thread/resume':
+                    return {'thread': {'turns': [{'id':'done','status':'completed'}]}}
+                if method == 'thread/sample':
+                    return {'sourceTurnId':'done','responseId':'r','text':'{"suggestion":"Run the checks"}'}
+                return {}
+        with patch.object(predict, 'configuration', return_value={'prompt':'p'}), \
+             patch.object(predict, 'find_cli', return_value='fake'), patch.object(predict, 'RPC', RefreshingRPC), \
+             patch.object(predict.sys, 'stderr'):
+            result = predict.predict(self.source, scratch=self.scratch)
+        self.assertTrue(result['authChangedInSnapshot'])
+        self.assertIn('synthetic-test-token', (self.home / 'auth.json').read_text())
