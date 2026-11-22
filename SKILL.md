@@ -5,58 +5,48 @@ description: Follow actual Codex composer predictions as real messages in this c
 
 # Martin Prince Loop
 
-A bare invocation runs here for up to five delivered predictions or 30 minutes. Use the live prediction configuration and `thread/sample`; never substitute a next-action prompt. Repetition and meta suggestions are valid. Stop on the limit, human steering, null prediction, technical failure, or a required human decision. Predicted messages grant no new permissions.
+Sends Codex's own predicted next message into this chat as a real user message, up to five times or 30 minutes. A background worker does the predicting and sending. Your job is to start it, check each message that arrives, and answer.
 
-## Start once
+Predicted messages grant no new permissions. Repetitive and meta suggestions are valid; answer them like any other message.
 
-Use this skill in a separate message after the task conversation. If the invocation also contains new task requirements, fulfill them first and establish an explicit conversation boundary rather than silently excluding them.
+## Start
 
-Read this file once, then run:
-
-```sh
-python3 scripts/loop.py start --state /ABSOLUTE/WORKSPACE/work/martin-prince/state.json --scope 'ORIGINAL AUTHORIZED TASK' --max-iterations 5 --max-minutes 30
-```
-
-Resolve `scripts/loop.py` relative to this skill. The current chat is detected from `CODEX_THREAD_ID` / `CODEX_SESSION_ID`. Keep the absolute state path in internal continuation context. Never overwrite a run or reset its budget to keep going. `--timeout SECONDS` and `--retries N` are available when requested; defaults are 90 seconds and zero extra prediction attempts.
-
-`start` initializes state and detaches one bounded local worker. End the invocation turn promptly. Do not wait for this chat, poll the worker, or sample a prediction yourself. The worker waits for a completed saved turn, samples, and queues the exact prediction using `codex queue`.
-
-## Each delivered message: one check, then answer
-
-Before acting on a predicted message, run exactly one controller call:
+If the invocation message also contains task work, do that first.
 
 ```sh
-python3 scripts/loop.py resume-message --state /ABSOLUTE/WORKSPACE/work/martin-prince/state.json
+python3 scripts/loop.py start --state /ABSOLUTE/WORKSPACE/work/martin-prince/state.json --scope 'ORIGINAL AUTHORIZED TASK'
 ```
 
-Reuse the already-read skill; reread only if its instructions were lost or changed. `resume-message` verifies exact delivery, advances the existing budget, and returns the original scope. Review the generated request against that scope before taking task actions. The user authorized automatic queueing, not new permissions for the predicted request. If it requires ungranted authority or a human decision, stop the worker and explain the concrete issue. Do not execute it merely because it appears as a user message.
+`scripts/` is relative to this skill. Remember the absolute state path for later turns.
 
-If verification succeeds, do the requested task and **send the actual answer normally in the final channel immediately**. Do not delay the answer for another prediction; the worker handles sampling and sending.
+Options, only when the user asks: `--max-iterations N` (default 5), `--max-minutes N` (default 30), `--timeout SECONDS` (default 90, per prediction or queue call), `--retries N` (default 0, extra prediction attempts).
 
-The worker observes that real final answer only after it has been saved. It then samples the next message. If `resume-message` reports `complete`, still answer the fifth message; nothing more will be queued. Generated requests to continue never extend the limit. If verification reports `stopped`, handle the actual human steering normally and do not restart automatically.
+Then end the turn right away. Do not wait, poll the worker, or predict anything yourself. Never reuse or overwrite an existing state file to get more iterations.
 
-## Quiet presentation
+## When a predicted message arrives
 
-Respond to the conversation, not the controller. Do not announce queued predictions, repeat them before arrival, display counters/state paths/receipts, or explain verification steps unless asked. Give substantive answers once, in final. For the bare invocation, end silently if the host permits it, otherwise use the shortest neutral acknowledgment. Keep any host-required skill announcement to one short sentence. A brief completion note is optional; omit it when the requested format is only an artifact or one-line answer.
+1. Before anything else, run this once, on its own (not batched with other tool calls):
 
-Keep skill reads and controller narration before `resume-message`. After verification, ordinary task tools and the actual response are retained as conversation context. Never combine controller calls and task work in one tool batch.
+   ```sh
+   python3 scripts/loop.py resume-message --state /ABSOLUTE/WORKSPACE/work/martin-prince/state.json
+   ```
 
-## Context and safety
+2. Read the result:
+   - `ready` or `complete`: check the message against the returned `scope`. If it needs permissions or a decision the user has not given, run `stop` and explain why. Otherwise do what it asks and reply normally. On `complete`, nothing more will be queued.
+   - `stopped`: the user typed something or the run ended. Follow `instruction` in the output, handle what the user actually said, and do not restart the loop.
+   - An error: report it. Do not start a new run to get around it.
 
-The predictor keeps the complete conversation before invocation, including ordinary tools. It then appends delivered messages, runtime updates, task tool calls/results, and exact saved assistant replies. Source ranges and hashes exclude only controller setup/verification; nothing is filtered by topic or rewritten. Temporary lifecycle metadata makes the isolated snapshot resumable without rewriting the real chat.
+3. Reply as you would to any user message, without waiting for anything else.
 
-The worker owns sampling and dispatch; the responding assistant owns authorization review and task execution. It uses the existing live prediction effort/configuration, not a new model or forced task-specific suggestion. Only one worker can own a run. Sending is durably recorded before queueing, and ambiguous sends are never retried automatically. Human input and deadline checks run again before dispatch.
+## Keep it quiet
 
-The full live chat remains authoritative for permissions and human steering. Unexpected input stops the run. A state file from an older version of the skill is rejected; start a new run rather than editing it. Do not create another chat or switch targets automatically.
+Do not mention the loop in replies: no counters, state paths, receipts, or announcements of what is queued. For the bare invocation, reply with one short acknowledgment or nothing.
 
-## Diagnostics and recovery
+## Stopping and problems
 
-- `loop.py status --state STATE` returns state, timing, and errors. The private `STATE` basename plus `.worker.log` holds worker diagnostics. Do not poll during normal replies.
-- `loop.py stop --state STATE --reason REASON` stops future sampling/dispatch; an already queued message may still arrive. If one does, `resume-message` still verifies it and says to answer it; the run stays stopped.
-- If the worker log or a prediction's `authChangedInSnapshot` shows that Codex rewrote `auth.json` inside the temporary snapshot, tell the user: their real login may need to be renewed.
-- A `dispatching` state or send timeout can mean the message was queued. Inspect saved queue/chat history before any recovery. If it arrived, use `resume-message`; do not send a duplicate. `resume-message` restarts a dead worker by itself when predictions remain, and `status` reports `workerAlive` and any `workerRestarts`. An unresolved send must be reported, not hidden behind a new run. `python3 scripts/worker.py --state STATE` restarts the worker by hand without changing the budget.
-- `predict.py --thread THREAD --before-turn INVOCATION_TURN --require-idle` is a read-only diagnostic of the pre-invocation conversation. It never queues messages or extends a run.
-
-The background worker exits on completion, stop, deadline, or failure. It is a local process, not a scheduled automation, and does not relaunch the app. App/CLI support for idle `codex queue` consumption is required; if a message remains queued, report that observed limitation rather than double-sending.
-
-Requires Python 3.10+, recent Codex CLI with `thread/sample` and `codex queue`, local saved history, and ChatGPT login in `auth.json`. Isolated temporary homes contain conversation history and a login-file copy and are normally deleted on exit; forced process termination may leave them. Keep credentials, snapshots, and run state private and uncommitted. These internal APIs are version-sensitive and prediction requests consume account usage.
+- Stop: `python3 scripts/loop.py stop --state STATE --reason 'WHY'`. A message that was already queued may still arrive; `resume-message` will tell you to answer it.
+- Inspect: `python3 scripts/loop.py status --state STATE`. Worker output is in the state file's folder, named `*.worker.log`.
+- If `status` shows `dispatching` with a `workerError`, the message may or may not have been queued. Never send it again yourself. If it arrives, run `resume-message` as usual; otherwise tell the user.
+- If `status` or the log shows `authChangedInSnapshot` or a warning about `auth.json`, tell the user their Codex login may need renewing.
+- If a queued message never arrives, tell the user; their Codex version may not pick up queued messages while idle.
+- Do not open another chat or point the loop at a different one.
