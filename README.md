@@ -9,22 +9,12 @@ A Codex skill that takes Codex's own composer prediction (the suggested next mes
 Needs Python 3.10+, a recent Codex desktop app/CLI (`thread/sample` and `codex queue`), and a ChatGPT login in `auth.json`. Tested on macOS.
 
 ```sh
-git clone \
-https://github.com\
-/turtlesoupy/\
-martin-prince-loop
-cd \
-martin-prince-loop
-
-d=$CODEX_HOME
-if [ -z "$d" ]
-then
-  d=~/.codex
-fi
-d="$d/skills"
-mkdir -p "$d"
-ln -s "$PWD" "$d/"
+git clone https://github.com/turtlesoupy/martin-prince-loop.git
+mkdir -p ~/.codex/skills
+ln -s "$PWD/martin-prince-loop" ~/.codex/skills/
 ```
+
+If you set `CODEX_HOME`, use that in place of `~/.codex`.
 
 ## Use
 
