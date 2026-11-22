@@ -165,3 +165,23 @@ class HistoryFixture(unittest.TestCase):
             self.assertEqual(turn['userFingerprint'], predict.user_fingerprint(original))
             self.assertIn('taskContextDigest', turn)
         self.assertEqual(self.source.records(), original)
+
+    def test_controller_snapshot_preserves_tools_and_source_fingerprint(self):
+        import conversation
+        original = self.active_records()
+        original[1]['payload']['turn_id'] = 'task'
+        original += [{'type':'event_msg','payload':{'type':'task_complete','turn_id':'task'}},
+            {'type':'event_msg','payload':{'type':'task_started','turn_id':'busy'}},
+            {'type':'response_item','payload':{'type':'message','role':'user','content':[{'type':'input_text','text':'<skill>loop instructions</skill>'}]}}]
+        self.rollout.write_text(''.join(json.dumps(r)+'\n' for r in original))
+        context = conversation.begin(original, 'target', 'busy')
+        before = self.rollout.read_bytes()
+        with predict.snapshot(self.source, self.scratch, checkpoint='Fixture inspected.', loop_context=context) as (_, copied, turn, _):
+            records = [json.loads(line) for line in copied.read_text().splitlines()]
+            text = copied.read_text()
+            self.assertIn('Fix the fixture', text)
+            self.assertIn('finished', text)
+            self.assertNotIn('<skill>', text)
+            self.assertEqual(turn['userFingerprint'], predict.user_fingerprint(original))
+            self.assertEqual(records[-1]['payload']['turn_id'], 'busy')
+        self.assertEqual(self.rollout.read_bytes(), before)

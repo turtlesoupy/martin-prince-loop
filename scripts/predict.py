@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Sample Codex's live composer-prediction prompt on an isolated chat snapshot."""
 import argparse
+import conversation
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -268,13 +269,24 @@ def task_projection(records, context, thread):
 
 
 @contextmanager
-def snapshot(source, scratch=None, idle=False, checkpoint=None, task_context=None):
+def snapshot(source, scratch=None, idle=False, checkpoint=None, task_context=None, loop_context=None, completed_context=False):
+    if completed_context and (not idle or checkpoint is not None or task_context is not None):
+        raise ValueError('Completed-response mode requires idle history and cannot use checkpoint prose or task selection.')
     if checkpoint is not None:
         if idle or not isinstance(checkpoint, str) or not checkpoint.strip():
             raise ValueError('Provide a nonempty checkpoint for same-chat mode; do not combine it with require-idle.')
         turn, rollout = source.latest(), source.rollout()
         original = source.records()
         projected = task_projection(original, task_context, source.thread) if task_context is not None else original
+        if loop_context is not None:
+            if task_context is not None:
+                raise ValueError('Do not combine task selection and conversation boundaries.')
+            projected = conversation.project(original, loop_context, source.thread)
+            # Preserve the real active turn ID for delivery checks, without its
+            # invocation or controller contents. Close only the isolated copy.
+            prefix = {**loop_context, 'segments': loop_context['segments'][:1]}
+            boundary = len(conversation.project(original, prefix, source.thread))
+            projected.insert(boundary, original[conversation.turn_start(original, turn['turn'])])
         records, removed = checkpoint_records(projected, turn, checkpoint)
         turn = {**turn, 'status': 'completed', 'snapshotMode': 'active-checkpoint',
             'userFingerprint': user_fingerprint(original), 'removedPendingCalls': removed,
@@ -291,6 +303,42 @@ def snapshot(source, scratch=None, idle=False, checkpoint=None, task_context=Non
             data = stream.read(turn['end'])
         if len(data) != turn['end'] or not data.endswith(b'\n'):
             raise RuntimeError('Snapshot boundary is not a complete saved record.')
+        if completed_context and loop_context is None:
+            raise ValueError('Completed conversation mode requires source boundaries.')
+        if loop_context is not None:
+            original = [json.loads(line) for line in data.splitlines()]
+            records = conversation.project(original, loop_context, source.thread)
+            if completed_context:
+                prefix = {**loop_context, 'segments': loop_context['segments'][:1]}
+                boundary = len(conversation.project(original, prefix, source.thread))
+                # Retain original replies/tools, not a generated checkpoint. Only
+                # lifecycle events are rebuilt to bind the copy to the live turn.
+                suffix = [r for r in records[boundary:] if not (r.get('type') == 'event_msg'
+                    and r.get('payload', {}).get('type') in ('task_started', 'task_complete'))]
+                starts = original[conversation.turn_start(original, turn['turn'])]
+                finishes = [r for r in original if r.get('type') == 'event_msg'
+                    and r.get('payload', {}).get('type') == 'task_complete'
+                    and r['payload'].get('turn_id') == turn['turn']]
+                if not finishes:
+                    raise TransientError('Completed turn has not been fully saved yet.')
+                import copy
+                finish = copy.deepcopy(finishes[-1])
+                replies = [r['payload'] for r in records if r.get('type') == 'response_item'
+                    and r.get('payload', {}).get('role') == 'assistant'
+                    and r['payload'].get('type') == 'message']
+                finish['payload']['last_agent_message'] = ''.join(
+                    p.get('text', '') for p in replies[-1].get('content', [])) if replies else ''
+                records = records[:boundary] + [starts] + suffix + [finish]
+                turn = {**turn, 'userFingerprint': user_fingerprint(original),
+                    'conversationDigest': conversation.digest(loop_context)}
+            else:
+                completed = [r['payload'] for r in records if r.get('type') == 'event_msg'
+                    and r.get('payload', {}).get('type') == 'task_complete']
+                if not completed:
+                    raise ValueError('Diagnostic conversation has no completed turn.')
+                turn = {**turn, 'turn': completed[-1]['turn_id']}
+            data = ''.join(json.dumps(r) + '\n' for r in records).encode()
+
     if scratch:
         Path(scratch).mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='martin-prince-', dir=scratch) as directory:
@@ -369,10 +417,10 @@ class RPC:
             stream.close()
 
 
-def predict(source, cli=None, scratch=None, idle=False, checkpoint=None, task_context=None, timeout=DEFAULT_TIMEOUT):
+def predict(source, cli=None, scratch=None, idle=False, checkpoint=None, task_context=None, timeout=DEFAULT_TIMEOUT, loop_context=None, completed_context=False):
     config = configuration(source.home)
     executable = find_cli(cli)
-    with snapshot(source, scratch=scratch, idle=idle, checkpoint=checkpoint, task_context=task_context) as (_, copied, turn, env):
+    with snapshot(source, scratch=scratch, idle=idle, checkpoint=checkpoint, task_context=task_context, loop_context=loop_context, completed_context=completed_context) as (_, copied, turn, env):
         rpc = RPC(executable, env)
         try:
             rpc.call('initialize', {'clientInfo': {'name': 'martin_prince_loop', 'version': '0.2.0'},
@@ -400,8 +448,8 @@ def predict(source, cli=None, scratch=None, idle=False, checkpoint=None, task_co
     if suggestion is not None and (not isinstance(suggestion, str) or not suggestion.strip()):
         raise RuntimeError('Invalid suggestion format.')
     return {'threadId': source.thread, 'sourceTurnId': turn['turn'], 'promptVersion': config.get('prompt_version'),
-        'method': 'thread/sample', 'context': 'isolated task transcript' if task_context is not None else ('isolated active-turn checkpoint' if checkpoint is not None else 'isolated completed-turn snapshot'),
-        **{key: turn[key] for key in ('userFingerprint', 'checkpointDigest', 'removedPendingCalls', 'taskContextDigest', 'taskMessageCount') if key in turn},
+        'method': 'thread/sample', 'context': 'conversation without loop administration' if loop_context is not None else 'isolated task transcript' if task_context is not None else ('isolated active-turn checkpoint' if checkpoint is not None else 'isolated completed-turn snapshot'),
+        **{key: turn[key] for key in ('userFingerprint', 'checkpointDigest', 'removedPendingCalls', 'taskContextDigest', 'taskMessageCount', 'conversationDigest') if key in turn},
         'suggestion': suggestion,
         'responseId': result.get('responseId'),
         'usage': {key: result.get(key) for key in ('inputTokens', 'cachedInputTokens', 'outputTokens')}}
@@ -410,6 +458,7 @@ def predict(source, cli=None, scratch=None, idle=False, checkpoint=None, task_co
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--thread', help='Defaults to the current Codex chat environment.')
+    parser.add_argument('--before-turn', help='Diagnostic only: sample the intact completed conversation before this invocation turn; never queue a message.')
     parser.add_argument('--task-context-file', help='Private manifest selecting exact source task messages.')
     parser.add_argument('--checkpoint-file', help='Factual assistant checkpoint for the current active turn.')
     parser.add_argument('--codex-home')
@@ -424,8 +473,12 @@ def main():
         raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM, interrupted)
     try:
-        result = predict(Source.resolve(args.thread, args.codex_home, args.sqlite_home),
-            cli=args.cli, scratch=args.scratch, idle=args.require_idle, timeout=args.timeout,
+        source = Source.resolve(args.thread, args.codex_home, args.sqlite_home)
+        if args.before_turn and (args.task_context_file or args.checkpoint_file):
+            raise ValueError('Diagnostic --before-turn cannot be combined with another context mode.')
+        context = conversation.begin(source.records(), source.thread, args.before_turn) if args.before_turn else None
+        result = predict(source,
+            cli=args.cli, scratch=args.scratch, idle=args.require_idle, timeout=args.timeout, loop_context=context,
             checkpoint=Path(args.checkpoint_file).read_text() if args.checkpoint_file else None,
             task_context=json.loads(Path(args.task_context_file).read_text()) if args.task_context_file else None)
         if args.output:

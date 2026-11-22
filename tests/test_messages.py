@@ -1,5 +1,6 @@
 import unittest
 import loop
+import conversation
 from pathlib import Path
 import test_same_chat
 
@@ -13,6 +14,14 @@ class MessageTests(unittest.TestCase):
         context.write_text('{}')
         self.state['taskContextFile'] = str(context)
         self.state['mode'] = 'chat-messages'
+        self.records = [{'type':'session_meta','payload':{'id':'test'}},
+            {'type':'event_msg','payload':{'type':'task_started','turn_id':self.source.turn}}]
+        def records():
+            if not any(r.get('payload', {}).get('turn_id') == self.source.turn for r in self.records):
+                self.records.append({'type':'event_msg','payload':{'type':'task_started','turn_id':self.source.turn}})
+            return self.records
+        self.source.records = records
+        self.state['conversationContext'] = conversation.begin(self.records, 'test', self.source.turn)
         self.args.receipt = 'accepted'
         self.following = []
         self.source.continuation = lambda _: self.following
@@ -77,10 +86,19 @@ class MessageTests(unittest.TestCase):
         self.assertEqual(self.state['proposal']['sendAttempts'], 1)
 
 
-    def test_full_history_without_manifest(self):
+    def test_old_runs_do_not_silently_reset_or_adopt_boundaries(self):
+        del self.state['conversationContext']
+        self.state['completedIterations'] = 1
+        with self.assertRaisesRegex(ValueError, 'predates conversation boundaries'):
+            self.do('next')
+        self.assertEqual(self.state['completedIterations'], 1)
+        self.assertEqual(self.samples, [])
+
+    def test_conversation_boundaries_without_task_manifest(self):
         del self.state['taskContextFile']
         def predictor(source, **kwargs):
             self.assertNotIn('task_context', kwargs)
+            self.assertIn('loop_context', kwargs)
             return self.predict(source, **kwargs)
         loop.operate(self.state, 'next', self.args, source=self.source, predictor=predictor)
         self.assertEqual(self.state['phase'], 'proposed')
@@ -91,6 +109,7 @@ class MessageTests(unittest.TestCase):
         deadline = self.state['deadline']
         def predictor(source, **kwargs):
             self.assertNotIn('task_context', kwargs)
+            self.assertIn('loop_context', kwargs)
             return self.predict(source, **kwargs)
         loop.operate(self.state, 'next', self.args, source=self.source, predictor=predictor)
         self.assertEqual(self.state['phase'], 'proposed')

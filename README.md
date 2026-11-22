@@ -34,16 +34,18 @@ In any Codex chat:
 $martin-prince-loop
 ```
 
-Each round samples a fresh prediction from the full saved conversation, queues it with `codex queue`, and picks the loop back up when the message arrives. It stops early on a null prediction, an error, a message you type yourself, or anything that needs your approval.
+A bounded background worker waits for the real final answer, then samples a fresh prediction and queues it with `codex queue`. The answering assistant makes one quick delivery check and replies normally; prediction happens afterward, not in front of the answer. There are no checkpoint files or per-turn prepare/send calls in the default workflow. It stops early on a null prediction, an error, a message you type yourself, or anything that needs your approval.
 
-The predictor sees the full saved conversation, including user intent, skill invocations, and loop discussion, plus a factual checkpoint for the active turn. No message-selection manifest is required. This is a fresh sample, not the desktop composer's cached suggestion; normal runtime context limits still apply.
+The predictor sees the complete conversation before invocation, then delivered messages and the work done to answer them—including ordinary tool calls and exact final replies, not prose summaries. Source boundaries exclude the skill invocation and its administration without filtering conversation topics. No hand-picked message manifest is required. This is a fresh sample, not the desktop composer's cached suggestion; normal runtime context limits still apply.
 
-See [SKILL.md](SKILL.md) for the full workflow and [references/supervise.md](references/supervise.md) to drive a different chat.
+See [SKILL.md](SKILL.md) for the workflow, authorization boundaries, and recovery. The worker automatically queues suggestions, but generated requests never grant new permissions; the responding assistant reviews scope before acting. Legacy manual/cross-chat supervision is documented in [references/supervise.md](references/supervise.md).
 
 ## Caveats
 
 - Relies on unofficial Codex internals that can change between versions.
-- Every prediction uses your account's model quota.
+- Every prediction uses your account's model quota and still takes time; answers no longer wait for that request.
+- The worker is a bounded local process. It stops on completion, human steering, deadline, or failure; it is not a scheduled automation. Worker failures are recorded in private state/logs.
+- Idle queue delivery depends on the desktop/CLI version. A queued message is not proof of delivery.
 - Temporary snapshots (chat history and a copy of `auth.json`) are deleted on exit, but a hard kill can leave them in your temp dir.
 
 ## Tests

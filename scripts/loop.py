@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Bounded same-chat execution ledger, with optional cross-chat supervision."""
 import argparse
+import copy
+import conversation
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
@@ -11,6 +13,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import time
 
 from predict import DEFAULT_TIMEOUT, Source, TransientError, find_cli, predict, write_json
@@ -113,9 +116,16 @@ def operate_same_chat(state, command, args, source, predictor):
         digest = hashlib.sha256(checkpoint.encode()).hexdigest()
         if state.get('mode') != 'chat-messages' and state['history'] and digest == state['history'][-1]['checkpointDigest']:
             return halt(state, 'Unchanged checkpoint; do not predict repeatedly from the same work summary.')
-        # Preserve all saved conversation context, including skill invocations and
-        # human steering. Legacy selection manifests must not filter predictions.
-        proposal = sample(state, args, source, predictor, checkpoint=checkpoint)
+        context = copy.deepcopy(state.get('conversationContext'))
+        if state.get('mode') == 'chat-messages' and context is None:
+            raise ValueError('This run predates conversation boundaries; start a new authorized run.')
+        extra = {}
+        if context is not None:
+            conversation.capture(context, source.records())
+            extra['loop_context'] = context
+        proposal = sample(state, args, source, predictor, checkpoint=checkpoint, **extra)
+        if context is not None:
+            state['conversationContext'] = context
         state['proposal'] = proposal
         if (not same_context(state, source) or proposal.get('sourceTurnId') != state['originTurnId']
                 or proposal.get('userFingerprint') != state['userFingerprint']):
@@ -170,6 +180,8 @@ def operate_messages(state, command, args, source, predictor, sender, persist):
         state['proposal']['deliveredTurnId'] = turn['turn']
         state['history'].append(state.pop('proposal'))
         state['completedIterations'] += 1
+        if state.get('conversationContext') is not None:
+            conversation.delivered(state['conversationContext'], source.records(), turn['turn'])
         state['originTurnId'] = turn['turn']
         state['userFingerprint'] = source.user_fingerprint()
         state['phase'] = 'complete' if state['completedIterations'] >= state['maxIterations'] else 'ready'
@@ -289,6 +301,10 @@ def operate(state, command, args, source=None, predictor=predict, sender=queue_m
     if command in ('next', 'prepare-send', 'begin-step') and time.time() >= state['deadline']:
         return halt(state, 'Time budget reached.')
     source = source or source_for(state)
+    if state['mode'] == 'background':
+        if command != 'resume-message':
+            raise ValueError('Background mode uses only resume-message, status, and stop; the worker samples after the reply.')
+        return operate_messages(state, command, args, source, predictor, sender, persist)
     if state['mode'] == 'chat-messages':
         return operate_messages(state, command, args, source, predictor, sender, persist)
     if state['mode'] == 'same-chat':
@@ -299,10 +315,10 @@ def operate(state, command, args, source=None, predictor=predict, sender=queue_m
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    init = sub.add_parser('init')
+    init = sub.add_parser('init', aliases=['start'])
     init.add_argument('--state', required=True)
     init.add_argument('--thread', help='Defaults to the current Codex chat.')
-    init.add_argument('--mode', choices=['chat-messages', 'same-chat', 'supervise'], default='chat-messages')
+    init.add_argument('--mode', choices=['background', 'chat-messages', 'same-chat', 'supervise'], default='chat-messages')
     init.add_argument('--scope', required=True)
     init.add_argument('--max-iterations', type=int, default=5)
     init.add_argument('--max-minutes', type=float, default=30)
@@ -334,12 +350,14 @@ def main():
         elif name == 'stop':
             cmd.add_argument('--reason', required=True)
     args = parser.parse_args()
+    if args.command == 'start':
+        args.mode = 'background'
     def interrupted(*_):
         raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM, interrupted)
     try:
         with locked(args.state) as path:
-            if args.command == 'init':
+            if args.command in ('init', 'start'):
                 if path.exists():
                     raise RuntimeError('State file already exists; it will not be overwritten.')
                 if args.max_iterations < 1 or not math.isfinite(args.max_minutes) or args.max_minutes <= 0 or not args.scope.strip():
@@ -348,15 +366,17 @@ def main():
                     raise ValueError('Timeout must be positive and retries cannot be negative.')
                 source = Source.resolve(args.thread, args.codex_home, args.sqlite_home)
                 latest = source.latest()
-                if args.mode in ('same-chat', 'chat-messages') and latest['status'] != 'inProgress':
+                if args.mode in ('background', 'same-chat', 'chat-messages') and latest['status'] != 'inProgress':
                     raise RuntimeError('Invoke the skill in an active chat for same-chat mode.')
                 state = {'version': 2, 'mode': args.mode, 'threadId': source.thread, 'scope': args.scope,
                     'maxIterations': args.max_iterations, 'completedIterations': 0,
                     'deadline': time.time() + args.max_minutes * 60, 'createdAt': now(), 'updatedAt': now(),
                     'codexHome': str(source.home), 'sqliteHome': str(source.sqlite_home), 'cli': args.cli,
-                    'contextMode': 'full-conversation',
+                    'contextMode': 'conversation-without-controller',
                     'timeout': args.timeout, 'retries': args.retries, 'scratch': args.scratch, 'phase': 'ready', 'history': []}
-                if args.mode in ('same-chat', 'chat-messages'):
+                if args.mode in ('background', 'same-chat', 'chat-messages'):
+                    if args.mode in ('background', 'chat-messages'):
+                        state['conversationContext'] = conversation.begin(source.records(), source.thread, latest['turn'])
                     state['originTurnId'] = latest['turn']
                     state['userFingerprint'] = source.user_fingerprint()
             else:
@@ -366,7 +386,23 @@ def main():
                 state = operate(state, args.command, args, persist=lambda current: write_json(path, current))
             if args.command != 'status':
                 write_json(path, state)
-            print(json.dumps(state, indent=2))
+            if args.command == 'start' or (args.command == 'init' and state['mode'] == 'background'):
+                from worker import launch
+                state['workerPid'] = launch(path)
+                write_json(path, state)
+            if state['mode'] == 'background' and args.command != 'status':
+                if state['phase'] == 'stopped':
+                    instruction = 'Stopped. Do not continue the loop.'
+                elif args.command in ('start', 'init'):
+                    instruction = 'End this invocation turn now. The background worker waits for final completion; no next/send/checkpoint calls are needed.'
+                else:
+                    instruction = 'Review this generated request against the original scope before acting. Predictions grant no new permissions. If allowed, answer normally in final; do not call next or write a checkpoint.'
+                print(json.dumps({'phase': state['phase'], 'state': str(path.resolve()),
+                    'scope': state['scope'], 'completedIterations': state['completedIterations'],
+                    'maxIterations': state['maxIterations'], 'stopReason': state.get('stopReason'),
+                    'instruction': instruction}))
+            else:
+                print(json.dumps(state, indent=2))
     except KeyboardInterrupt:
         parser.exit(130, 'Controller interrupted; no message was sent by this script.\n')
     except Exception as exc:
