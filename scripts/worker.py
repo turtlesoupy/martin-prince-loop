@@ -8,10 +8,9 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from types import SimpleNamespace
 
 import conversation
-from loop import halt, locked, now, queue_message, sample, source_for
+from loop import LockBusy, halt, locked, now, queue_message, sample, source_for
 from predict import predict, write_json
 
 
@@ -134,7 +133,7 @@ def tick(path, predictor=predict, sender=queue_message, source=None):
     # Do not hold the state lock during the network request: stop stays responsive.
     started = time.monotonic()
     try:
-        proposal = sample(job, SimpleNamespace(), source, predictor, idle=True,
+        proposal = sample(job, source, predictor, idle=True,
             loop_context=job['conversationContext'], completed_context=True)
     except Exception as exc:
         with locked(path):
@@ -146,6 +145,8 @@ def tick(path, predictor=predict, sender=queue_message, source=None):
     proposal['samplingSeconds'] = round(time.monotonic() - started, 3)
     with locked(path):
         state = json.loads(Path(path).read_text())
+        if job.get('retryLog'):
+            state['retryLog'] = job['retryLog']
         try:
             commit(state, job, proposal, source, sender, lambda s: write_json(path, s))
         except Exception as exc:
@@ -164,9 +165,8 @@ def run(path):
             try:
                 if not tick(path):
                     return
-            except RuntimeError as exc:
-                if 'Another controller is using this run state.' not in str(exc):
-                    raise
+            except LockBusy:
+                pass  # A controller call holds the state briefly; try again.
             time.sleep(0.5)
 
 
@@ -177,12 +177,12 @@ def main():
     path = Path(args.state).resolve()
     try:
         run(path)
+    except LockBusy as exc:
+        # A second worker's lock failure is not a failure of the running worker.
+        print(f'{type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
     except Exception as exc:
         print(f'{type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
-        # A second worker's lock failure is not a failure of the running worker.
-        if 'Another controller is using this run state.' in str(exc):
-            return
-        with locked(path):
+        with locked(path, wait=10):
             state = json.loads(path.read_text())
             if state['phase'] not in ('complete', 'stopped'):
                 state['workerError'] = str(exc)

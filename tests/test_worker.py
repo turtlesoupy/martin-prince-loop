@@ -187,10 +187,6 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(self.tick(predictor=next_prediction))
         self.assertEqual(self.sent,['make it sleepy','give it a friend'])
 
-    def test_background_rejects_legacy_checkpoint_workflow(self):
-        with self.assertRaisesRegex(ValueError,'worker samples after the reply'):
-            loop.operate(self.state,'next',SimpleNamespace(),source=self.source)
-
     def test_limit_exits_worker_without_another_prediction(self):
         s=json.loads(self.path.read_text());s['completedIterations']=2;predict.write_json(self.path,s)
         self.assertFalse(self.tick())
@@ -233,9 +229,3 @@ class WorkerTests(unittest.TestCase):
                     time.sleep(0.1)
         finally:
             state=json.loads(path.read_text());loop.halt(state,'test cleanup');predict.write_json(path,state)
-
-    def test_completed_mode_refuses_checkpoint_injection(self):
-        with self.assertRaisesRegex(ValueError, 'cannot use checkpoint prose'):
-            with predict.snapshot(self.source,idle=True,completed_context=True,
-                    loop_context=self.state['conversationContext'],checkpoint='The answer is ...'):
-                self.fail('Checkpoint prose must not reach completed-response sampling')

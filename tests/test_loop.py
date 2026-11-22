@@ -1,6 +1,7 @@
 from pathlib import Path
-from types import SimpleNamespace
 import sys
+import tempfile
+import threading
 import time
 import unittest
 
@@ -8,108 +9,63 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import loop
 
 
-class FakeSource:
-    def __init__(self):
-        self.current = {'turn':'original','status':'completed'}
-        self.following = []
-    def latest(self): return self.current
-    def continuation(self, _): return self.following
-
-
-class ControllerTests(unittest.TestCase):
+class RetryTests(unittest.TestCase):
     def setUp(self):
-        self.state = {'mode':'supervise','phase':'ready','deadline':time.time()+600,'maxIterations':2,
-            'completedIterations':0,'history':[],'cli':None,'scratch':None}
-        self.source = FakeSource()
-        self.args = SimpleNamespace(response_id='response', review='Within the authorized test task', receipt='accepted', reason='User stopped')
-        self.suggestion = 'Run the checks'
-        self.samples = 0
+        self.state = {'cli': None, 'scratch': None, 'timeout': 5, 'deadline': time.time() + 600}
+        self.delays, self.attempts = [], 0
+        original = loop.sleep
+        loop.sleep = self.delays.append
+        self.addCleanup(setattr, loop, 'sleep', original)
 
-    def predict(self, source, **_):
-        self.samples += 1
-        return {'sourceTurnId':source.latest()['turn'],'responseId':'response','suggestion':self.suggestion}
+    def flaky(self, failures):
+        def predictor(source, **kwargs):
+            self.attempts += 1
+            self.assertEqual(kwargs['timeout'], 5)
+            if self.attempts <= failures: raise loop.TransientError('thread/sample timed out')
+            return {'suggestion': 'Run the checks'}
+        return predictor
 
-    def do(self, command):
-        return loop.operate(self.state, command, self.args, source=self.source, predictor=self.predict)
+    def test_transient_failures_retry_with_backoff(self):
+        self.state['retries'] = 2
+        self.assertEqual(loop.sample(self.state, None, self.flaky(2))['suggestion'], 'Run the checks')
+        self.assertEqual(self.delays, [1, 2])
+        self.assertEqual(len(self.state['retryLog']), 2)
 
-    def dispatch(self):
-        self.do('next'); self.do('prepare-send'); self.do('sent')
+    def test_retries_default_to_zero(self):
+        with self.assertRaisesRegex(RuntimeError, 'after 1 attempt'): loop.sample(self.state, None, self.flaky(1))
+        self.assertEqual(self.delays, [])
 
-    def finish(self, turn):
-        self.source.current = {'turn':turn,'status':'completed'}
-        self.source.following = [{'turn':turn,'status':'completed','messages':[self.suggestion]}]
-        self.do('complete-step')
+    def test_retries_stop_at_the_deadline(self):
+        self.state.update(retries=5, deadline=time.time() + 0.5)
+        with self.assertRaisesRegex(RuntimeError, 'after 1 attempt'): loop.sample(self.state, None, self.flaky(5))
 
-    def test_two_complete_iterations_enforce_budget(self):
-        self.dispatch(); self.finish('step-one')
-        self.assertEqual(self.state['phase'], 'ready')
-        self.suggestion = 'Summarize the verified result'
-        self.dispatch(); self.finish('step-two')
-        self.assertEqual(self.state['completedIterations'], 2)
-        self.assertEqual(self.state['phase'], 'complete')
-        with self.assertRaisesRegex(RuntimeError, 'ended'): self.do('next')
-        self.assertEqual(self.samples, 2)
+    def test_non_transient_errors_are_not_retried(self):
+        self.state['retries'] = 3
+        def broken(source, **kwargs): raise RuntimeError('Live prediction prompt is disabled')
+        with self.assertRaisesRegex(RuntimeError, 'disabled'): loop.sample(self.state, None, broken)
+        self.assertEqual(self.delays, [])
 
-    def test_ambiguous_send_is_never_replayed_and_can_be_reconciled(self):
-        self.do('next'); self.do('prepare-send')
-        # Simulated crash after connector acceptance but before recording sent.
-        with self.assertRaisesRegex(RuntimeError, 'resolve'): self.do('next')
-        with self.assertRaisesRegex(RuntimeError, 'Only a proposed'): self.do('prepare-send')
-        self.assertEqual(self.samples, 1)
-        self.finish('delivered-once')
-        self.assertEqual(self.state['completedIterations'], 1)
 
-    def test_stale_prediction_cannot_be_prepared(self):
-        self.do('next')
-        self.source.current = {'turn':'human-intervened','status':'completed'}
-        self.do('prepare-send')
-        self.assertEqual(self.state['phase'], 'stopped')
-        self.assertIn('changed', self.state['stopReason'])
+class LockTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / 'state.json'
 
-    def test_target_change_during_generation_stops(self):
-        def racing_predict(source, **kwargs):
-            proposal = self.predict(source, **kwargs)
-            source.current = {'turn':'new-input','status':'inProgress'}
-            return proposal
-        loop.operate(self.state, 'next', self.args, source=self.source, predictor=racing_predict)
-        self.assertEqual(self.state['phase'], 'stopped')
+    def hold(self, seconds):
+        held = threading.Event()
+        def holder():
+            with loop.locked(self.path):
+                held.set(); time.sleep(seconds)
+        thread = threading.Thread(target=holder); thread.start()
+        self.addCleanup(thread.join)
+        held.wait()
 
-    def test_unrelated_or_additional_user_messages_stop(self):
-        self.dispatch()
-        self.source.current = {'turn':'different','status':'completed'}
-        self.source.following = [{'turn':'different','status':'completed','messages':['Do unrelated work']}]
-        self.do('complete-step')
-        self.assertEqual(self.state['phase'], 'stopped')
-        self.assertEqual(self.state['completedIterations'], 0)
+    def test_busy_lock_fails_immediately_by_default(self):
+        self.hold(0.3)
+        with self.assertRaises(loop.LockBusy):
+            with loop.locked(self.path): pass
 
-    def test_duplicate_proposal_does_not_generate_twice(self):
-        self.do('next'); self.do('next')
-        self.assertEqual(self.samples, 1)
-
-    def test_repeated_suggestion_is_allowed(self):
-        self.dispatch(); self.finish('first')
-        self.do('next')
-        self.assertEqual(self.state['phase'], 'proposed')
-        self.assertEqual(self.state['proposal']['suggestion'], self.state['history'][0]['suggestion'])
-
-    def test_expired_budget_cannot_dispatch_existing_proposal(self):
-        self.do('next'); self.state['deadline'] = time.time()-1
-        self.do('prepare-send')
-        self.assertEqual(self.state['phase'], 'stopped')
-
-    def test_null_prediction_stops(self):
-        self.suggestion = None
-        self.do('next')
-        self.assertEqual(self.state['phase'], 'stopped')
-
-    def test_failure_is_not_counted_as_completion(self):
-        self.dispatch()
-        self.source.following = [{'turn':'failed','status':'failed','messages':[self.suggestion]}]
-        self.do('complete-step')
-        self.assertEqual(self.state['phase'], 'stopped')
-        self.assertEqual(self.state['completedIterations'], 0)
-
-    def test_wrong_reviewed_response_id_is_rejected(self):
-        self.do('next'); self.args.response_id = 'wrong'
-        with self.assertRaisesRegex(RuntimeError, 'does not match'): self.do('prepare-send')
-        self.assertEqual(self.state['phase'], 'proposed')
+    def test_controller_waits_out_a_brief_holder(self):
+        self.hold(0.3)
+        with loop.locked(self.path, wait=5): pass

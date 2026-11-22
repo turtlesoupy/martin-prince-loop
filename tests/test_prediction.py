@@ -1,5 +1,4 @@
 import json
-import hashlib
 import os
 from pathlib import Path
 import sqlite3
@@ -113,34 +112,6 @@ class HistoryFixture(unittest.TestCase):
         self.rollout.write_text(''.join(json.dumps(r)+'\n' for r in records))
         return records
 
-    def test_active_checkpoint_keeps_work_and_only_closes_the_copy(self):
-        original = self.active_records()
-        before = self.rollout.read_bytes()
-        with predict.snapshot(self.source, self.scratch, checkpoint='The fixture was inspected.') as (home, copied, turn, _):
-            records = [json.loads(line) for line in copied.read_text().splitlines()]
-            payloads = [r.get('payload',{}) for r in records]
-            self.assertTrue(any(p.get('call_id')=='finished' for p in payloads))
-            self.assertFalse(any(p.get('call_id')=='pending' for p in payloads))
-            self.assertEqual(payloads[-1]['type'], 'task_complete')
-            self.assertEqual(payloads[-1]['turn_id'], 'busy')
-            self.assertEqual(payloads[-2]['content'][0]['text'], 'The fixture was inspected.')
-            self.assertEqual(turn['removedPendingCalls'], 1)
-            self.assertEqual(turn['userFingerprint'], predict.user_fingerprint(original))
-            self.assertEqual(turn['turn'], 'busy')
-        self.assertEqual(self.rollout.read_bytes(), before)
-        self.assertEqual(self.source.latest()['status'], 'inProgress')
-        self.assertFalse(home.exists())
-
-    def test_partial_tail_is_ignored_and_current_turn_must_match(self):
-        self.active_records()
-        with self.rollout.open('ab') as f:f.write(b'{"partial":')
-        with predict.snapshot(self.source, self.scratch, checkpoint='Inspection completed.'):
-            pass
-        records = self.active_records()
-        records[1]['payload']['turn_id']='another-turn'
-        with self.assertRaisesRegex(RuntimeError, 'disagree'):
-            predict.checkpoint_records(records, self.source.latest(), 'Inspection completed.')
-
     def test_user_fingerprint_ignores_agent_work_but_detects_steering(self):
         records = self.active_records()
         baseline = predict.user_fingerprint(records)
@@ -149,39 +120,6 @@ class HistoryFixture(unittest.TestCase):
         records.append({'type':'response_item','payload':{'type':'message','role':'user','content':[{'text':'stop'}]}})
         self.assertNotEqual(predict.user_fingerprint(records), baseline)
 
-    def test_same_chat_defaults_from_environment(self):
+    def test_thread_defaults_from_environment(self):
         with patch.dict(os.environ, {'CODEX_THREAD_ID':'current-chat'}):
             self.assertEqual(predict.Source.resolve(home=self.home, sqlite_home=self.home).thread, 'current-chat')
-
-    def test_task_snapshot_excludes_tools_and_keeps_full_source_fingerprint(self):
-        original = self.active_records()
-        context = {'version':1,'threadId':'target','messages':[{'index':2,
-            'sha256':hashlib.sha256(json.dumps(original[2],sort_keys=True).encode()).hexdigest()}]}
-        with predict.snapshot(self.source, self.scratch, checkpoint='Fixture inspected.', task_context=context) as (_, copied, turn, _):
-            text = copied.read_text()
-            self.assertIn('Fix the fixture', text)
-            self.assertNotIn('call_id', text)
-            self.assertEqual(turn['taskMessageCount'], 1)
-            self.assertEqual(turn['userFingerprint'], predict.user_fingerprint(original))
-            self.assertIn('taskContextDigest', turn)
-        self.assertEqual(self.source.records(), original)
-
-    def test_controller_snapshot_preserves_tools_and_source_fingerprint(self):
-        import conversation
-        original = self.active_records()
-        original[1]['payload']['turn_id'] = 'task'
-        original += [{'type':'event_msg','payload':{'type':'task_complete','turn_id':'task'}},
-            {'type':'event_msg','payload':{'type':'task_started','turn_id':'busy'}},
-            {'type':'response_item','payload':{'type':'message','role':'user','content':[{'type':'input_text','text':'<skill>loop instructions</skill>'}]}}]
-        self.rollout.write_text(''.join(json.dumps(r)+'\n' for r in original))
-        context = conversation.begin(original, 'target', 'busy')
-        before = self.rollout.read_bytes()
-        with predict.snapshot(self.source, self.scratch, checkpoint='Fixture inspected.', loop_context=context) as (_, copied, turn, _):
-            records = [json.loads(line) for line in copied.read_text().splitlines()]
-            text = copied.read_text()
-            self.assertIn('Fix the fixture', text)
-            self.assertIn('finished', text)
-            self.assertNotIn('<skill>', text)
-            self.assertEqual(turn['userFingerprint'], predict.user_fingerprint(original))
-            self.assertEqual(records[-1]['payload']['turn_id'], 'busy')
-        self.assertEqual(self.rollout.read_bytes(), before)

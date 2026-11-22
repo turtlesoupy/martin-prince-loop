@@ -1,6 +1,9 @@
 import copy
+from pathlib import Path
+import sys
 import unittest
-from test_prediction import predict
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import conversation
 
 
@@ -24,16 +27,14 @@ class ConversationTests(unittest.TestCase):
             msg('user','make it sleepy'), msg('assistant','Verifying delivery'), call('resume')]
         conversation.delivered(context, records, 'delivered')
         records += [call('resume', True), call('drawing-tool'), call('drawing-tool', True),
-            msg('assistant','sleepy cat'), call('pending-prediction')]
+            msg('assistant','sleepy cat')]
         before = copy.deepcopy(records)
         conversation.capture(context, records)
-        projected = conversation.project(records, context, 'thread')
-        projected.append(start('delivered'))
-        closed, _ = predict.checkpoint_records(projected, {'turn':'delivered','status':'inProgress'}, 'sleepy cat')
+        closed = conversation.project(records, context, 'thread')
         self.assertEqual(records, before)
         for id in ('ordinary','drawing-tool'):
             self.assertEqual(sum(r.get('payload',{}).get('call_id') == id for r in closed), 2)
-        for id in ('init','queue','resume','pending-prediction'):
+        for id in ('init','queue','resume'):
             self.assertFalse(any(r.get('payload',{}).get('call_id') == id for r in closed))
         for text in ('$martin-prince-loop','<skill>controller</skill>','Verifying delivery'):
             self.assertNotIn(msg('user',text), closed)

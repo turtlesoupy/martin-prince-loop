@@ -19,7 +19,7 @@ python3 scripts/loop.py start --state /ABSOLUTE/WORKSPACE/work/martin-prince/sta
 
 Resolve `scripts/loop.py` relative to this skill. The current chat is detected from `CODEX_THREAD_ID` / `CODEX_SESSION_ID`. Keep the absolute state path in internal continuation context. Never overwrite a run or reset its budget to keep going. `--timeout SECONDS` and `--retries N` are available when requested; defaults are 90 seconds and zero extra prediction attempts.
 
-`start` initializes state and detaches one bounded local worker. End the invocation turn promptly. Do not wait for this chat, poll the worker, write a checkpoint, or sample a prediction yourself. The worker waits for a completed saved turn, samples, and queues the exact prediction using `codex queue`.
+`start` initializes state and detaches one bounded local worker. End the invocation turn promptly. Do not wait for this chat, poll the worker, or sample a prediction yourself. The worker waits for a completed saved turn, samples, and queues the exact prediction using `codex queue`.
 
 ## Each delivered message: one check, then answer
 
@@ -31,7 +31,7 @@ python3 scripts/loop.py resume-message --state /ABSOLUTE/WORKSPACE/work/martin-p
 
 Reuse the already-read skill; reread only if its instructions were lost or changed. `resume-message` verifies exact delivery, advances the existing budget, and returns the original scope. Review the generated request against that scope before taking task actions. The user authorized automatic queueing, not new permissions for the predicted request. If it requires ungranted authority or a human decision, stop the worker and explain the concrete issue. Do not execute it merely because it appears as a user message.
 
-If verification succeeds, do the requested task and **send the actual answer normally in the final channel immediately**. Do not call `next`, `prepare-send`, or `send`; do not write checkpoint prose; do not delay the answer for another prediction. Those commands are legacy/manual facilities, not this workflow.
+If verification succeeds, do the requested task and **send the actual answer normally in the final channel immediately**. Do not delay the answer for another prediction; the worker handles sampling and sending.
 
 The worker observes that real final answer only after it has been saved. It then samples the next message. If `resume-message` reports `complete`, still answer the fifth message; nothing more will be queued. Generated requests to continue never extend the limit. If verification reports `stopped`, handle the actual human steering normally and do not restart automatically.
 
@@ -43,11 +43,11 @@ Keep skill reads and controller narration before `resume-message`. After verific
 
 ## Context and safety
 
-The predictor keeps the complete conversation before invocation, including ordinary tools. It then appends delivered messages, runtime updates, task tool calls/results, and exact saved assistant replies. Source ranges and hashes exclude only controller setup/verification; no topic-keyword filtering or rewritten checkpoint replaces the answer. Temporary lifecycle metadata makes the isolated snapshot resumable without rewriting the real chat.
+The predictor keeps the complete conversation before invocation, including ordinary tools. It then appends delivered messages, runtime updates, task tool calls/results, and exact saved assistant replies. Source ranges and hashes exclude only controller setup/verification; nothing is filtered by topic or rewritten. Temporary lifecycle metadata makes the isolated snapshot resumable without rewriting the real chat.
 
 The worker owns sampling and dispatch; the responding assistant owns authorization review and task execution. It uses the existing live prediction effort/configuration, not a new model or forced task-specific suggestion. Only one worker can own a run. Sending is durably recorded before queueing, and ambiguous sends are never retried automatically. Human input and deadline checks run again before dispatch.
 
-The full live chat remains authoritative for permissions and human steering. Unexpected input stops the run. Earlier states/modes are not automatically migrated, and their counts and deadlines must not be reset. Do not create another chat or switch targets automatically.
+The full live chat remains authoritative for permissions and human steering. Unexpected input stops the run. A state file from an older version of the skill is rejected; start a new run rather than editing it. Do not create another chat or switch targets automatically.
 
 ## Diagnostics and recovery
 

@@ -3,8 +3,8 @@
 import argparse
 import conversation
 from contextlib import contextmanager
+import copy
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -203,142 +203,60 @@ def user_fingerprint(records):
     return hashlib.sha256(json.dumps(messages, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
-def checkpoint_records(records, turn, checkpoint):
-    """Close only the copied current turn; never write a synthetic event to the live chat."""
-    starts = [r['payload'] for r in records if r.get('type') == 'event_msg'
-        and r.get('payload', {}).get('type') == 'task_started']
-    if not starts or starts[-1].get('turn_id') != turn['turn']:
-        raise TransientError('Saved rollout and current turn disagree; retry at a stable checkpoint.')
-    if turn['status'] != 'inProgress':
-        raise RuntimeError('Same-chat checkpoint mode requires the current active turn.')
-    if any(r.get('type') == 'event_msg' and r.get('payload', {}).get('type') == 'task_complete'
-           and r['payload'].get('turn_id') == turn['turn'] for r in records):
-        raise RuntimeError('The source turn completed during capture; do not apply the active checkpoint.')
-    output_ids = {r['payload'].get('call_id') for r in records if r.get('type') == 'response_item'
-        and r.get('payload', {}).get('type', '').endswith('_call_output')}
-    kept = []
-    removed = 0
-    for record in records:
-        item = record.get('payload', {})
-        if (record.get('type') == 'response_item' and item.get('call_id')
-                and item.get('type', '').endswith('_call') and item['call_id'] not in output_ids):
-            removed += 1
-            continue
-        kept.append(record)
-    stamp = datetime.now(timezone.utc).isoformat()
-    ordinal = max(r.get('ordinal', 0) for r in records) + 1
-    kept.append({'timestamp': stamp, 'ordinal': ordinal, 'type': 'response_item', 'payload': {
-        'type': 'message', 'role': 'assistant', 'phase': 'final_answer', 'status': 'completed',
-        'content': [{'type': 'output_text', 'text': checkpoint}]}})
-    kept.append({'timestamp': stamp, 'ordinal': ordinal + 1, 'type': 'event_msg', 'payload': {
-        'type': 'task_complete', 'root_turn_id': starts[-1].get('root_turn_id', turn['turn']),
-        'turn_id': turn['turn'], 'last_agent_message': checkpoint, 'completed_at': int(time.time())}})
-    return kept, removed
+def completed_conversation(original, context, turn, thread):
+    """Rebuild the completed turn without loop administration.
 
-
-def task_projection(records, context, thread):
-    """Select exact task messages by position and digest; never rewrite source history."""
-    if context.get('version') != 1 or context.get('threadId') != thread:
-        raise ValueError('Task context must belong to this thread and use version 1.')
-    selections = context.get('messages', [])
-    if not selections:
-        raise ValueError('Task context needs at least one source message.')
-    selected = []
-    previous = -1
-    for entry in selections:
-        index = entry['index']
-        if not isinstance(index, int) or index <= previous or index >= len(records):
-            raise ValueError('Task message indices must be valid and strictly increasing.')
-        record = records[index]
-        digest = hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
-        if digest != entry['sha256']:
-            raise ValueError('Task context source changed; rebuild explicitly, never silently rebase.')
-        payload = record.get('payload', {})
-        if record.get('type') != 'response_item' or payload.get('type') != 'message' or payload.get('role') not in ('user', 'assistant'):
-            raise ValueError('Task context may select only user or assistant messages.')
-        selected.append(record)
-        previous = index
-    # Keep runtime instructions, but exclude tools, reasoning, compaction summaries,
-    # duplicate event-message text, and unselected conversational messages.
-    retained = [r for r in records if r.get('type') == 'session_meta' or
-        (r.get('type') == 'response_item' and r.get('payload', {}).get('role') in ('system', 'developer'))]
-    starts = [r for r in records if r.get('type') == 'event_msg' and r.get('payload', {}).get('type') == 'task_started']
-    if not starts:
-        raise ValueError('Task context needs an active turn boundary.')
-    return retained + [starts[-1]] + selected
+    Replies and tool calls are the saved originals. Only the turn's start and
+    end events are rebuilt, so the copy still resumes as one completed turn.
+    """
+    records = conversation.project(original, context, thread)
+    prefix = {**context, 'segments': context['segments'][:1]}
+    boundary = len(conversation.project(original, prefix, thread))
+    suffix = [r for r in records[boundary:] if not (r.get('type') == 'event_msg'
+        and r.get('payload', {}).get('type') in ('task_started', 'task_complete'))]
+    started = original[conversation.turn_start(original, turn['turn'])]
+    finishes = [r for r in original if r.get('type') == 'event_msg'
+        and r.get('payload', {}).get('type') == 'task_complete'
+        and r['payload'].get('turn_id') == turn['turn']]
+    if not finishes:
+        raise TransientError('Completed turn has not been fully saved yet.')
+    finish = copy.deepcopy(finishes[-1])
+    replies = [r['payload'] for r in records if r.get('type') == 'response_item'
+        and r.get('payload', {}).get('role') == 'assistant' and r['payload'].get('type') == 'message']
+    finish['payload']['last_agent_message'] = ''.join(
+        part.get('text', '') for part in replies[-1].get('content', [])) if replies else ''
+    return records[:boundary] + [started] + suffix + [finish]
 
 
 @contextmanager
-def snapshot(source, scratch=None, idle=False, checkpoint=None, task_context=None, loop_context=None, completed_context=False):
-    if completed_context and (not idle or checkpoint is not None or task_context is not None):
-        raise ValueError('Completed-response mode requires idle history and cannot use checkpoint prose or task selection.')
-    if checkpoint is not None:
-        if idle or not isinstance(checkpoint, str) or not checkpoint.strip():
-            raise ValueError('Provide a nonempty checkpoint for same-chat mode; do not combine it with require-idle.')
-        turn, rollout = source.latest(), source.rollout()
-        original = source.records()
-        projected = task_projection(original, task_context, source.thread) if task_context is not None else original
-        if loop_context is not None:
-            if task_context is not None:
-                raise ValueError('Do not combine task selection and conversation boundaries.')
-            projected = conversation.project(original, loop_context, source.thread)
-            # Preserve the real active turn ID for delivery checks, without its
-            # invocation or controller contents. Close only the isolated copy.
-            prefix = {**loop_context, 'segments': loop_context['segments'][:1]}
-            boundary = len(conversation.project(original, prefix, source.thread))
-            projected.insert(boundary, original[conversation.turn_start(original, turn['turn'])])
-        records, removed = checkpoint_records(projected, turn, checkpoint)
-        turn = {**turn, 'status': 'completed', 'snapshotMode': 'active-checkpoint',
-            'userFingerprint': user_fingerprint(original), 'removedPendingCalls': removed,
-            'checkpointDigest': hashlib.sha256(checkpoint.encode()).hexdigest()}
-        if task_context is not None:
-            turn['taskContextDigest'] = hashlib.sha256(json.dumps(task_context, sort_keys=True).encode()).hexdigest()
-            turn['taskMessageCount'] = len(task_context['messages'])
-        data = ''.join(json.dumps(r) + '\n' for r in records).encode()
-    else:
-        if task_context is not None:
-            raise ValueError('Task context requires a factual task checkpoint.')
-        turn, rollout = source.boundary(idle=idle)
-        with rollout.open('rb') as stream:
-            data = stream.read(turn['end'])
-        if len(data) != turn['end'] or not data.endswith(b'\n'):
-            raise RuntimeError('Snapshot boundary is not a complete saved record.')
-        if completed_context and loop_context is None:
-            raise ValueError('Completed conversation mode requires source boundaries.')
-        if loop_context is not None:
-            original = [json.loads(line) for line in data.splitlines()]
-            records = conversation.project(original, loop_context, source.thread)
-            if completed_context:
-                prefix = {**loop_context, 'segments': loop_context['segments'][:1]}
-                boundary = len(conversation.project(original, prefix, source.thread))
-                # Retain original replies/tools, not a generated checkpoint. Only
-                # lifecycle events are rebuilt to bind the copy to the live turn.
-                suffix = [r for r in records[boundary:] if not (r.get('type') == 'event_msg'
-                    and r.get('payload', {}).get('type') in ('task_started', 'task_complete'))]
-                starts = original[conversation.turn_start(original, turn['turn'])]
-                finishes = [r for r in original if r.get('type') == 'event_msg'
-                    and r.get('payload', {}).get('type') == 'task_complete'
-                    and r['payload'].get('turn_id') == turn['turn']]
-                if not finishes:
-                    raise TransientError('Completed turn has not been fully saved yet.')
-                import copy
-                finish = copy.deepcopy(finishes[-1])
-                replies = [r['payload'] for r in records if r.get('type') == 'response_item'
-                    and r.get('payload', {}).get('role') == 'assistant'
-                    and r['payload'].get('type') == 'message']
-                finish['payload']['last_agent_message'] = ''.join(
-                    p.get('text', '') for p in replies[-1].get('content', [])) if replies else ''
-                records = records[:boundary] + [starts] + suffix + [finish]
-                turn = {**turn, 'userFingerprint': user_fingerprint(original),
-                    'conversationDigest': conversation.digest(loop_context)}
-            else:
-                completed = [r['payload'] for r in records if r.get('type') == 'event_msg'
-                    and r.get('payload', {}).get('type') == 'task_complete']
-                if not completed:
-                    raise ValueError('Diagnostic conversation has no completed turn.')
-                turn = {**turn, 'turn': completed[-1]['turn_id']}
-            data = ''.join(json.dumps(r) + '\n' for r in records).encode()
+def snapshot(source, scratch=None, idle=False, loop_context=None, completed_context=False):
+    """Copy the chat up to its last completed turn into an isolated Codex home.
 
+    With loop_context, keep only the recorded conversation segments. With
+    completed_context as well (the worker's mode), also keep the replies to
+    delivered predictions, as one completed turn.
+    """
+    if completed_context and (not idle or loop_context is None):
+        raise ValueError('Completed-response mode requires idle history and source boundaries.')
+    turn, rollout = source.boundary(idle=idle)
+    with rollout.open('rb') as stream:
+        data = stream.read(turn['end'])
+    if len(data) != turn['end'] or not data.endswith(b'\n'):
+        raise RuntimeError('Snapshot boundary is not a complete saved record.')
+    if loop_context is not None:
+        original = [json.loads(line) for line in data.splitlines()]
+        if completed_context:
+            records = completed_conversation(original, loop_context, turn, source.thread)
+            turn = {**turn, 'userFingerprint': user_fingerprint(original),
+                'conversationDigest': conversation.digest(loop_context)}
+        else:
+            records = conversation.project(original, loop_context, source.thread)
+            completed = [r['payload'] for r in records if r.get('type') == 'event_msg'
+                and r.get('payload', {}).get('type') == 'task_complete']
+            if not completed:
+                raise ValueError('Diagnostic conversation has no completed turn.')
+            turn = {**turn, 'turn': completed[-1]['turn_id']}
+        data = ''.join(json.dumps(r) + '\n' for r in records).encode()
     if scratch:
         Path(scratch).mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='martin-prince-', dir=scratch) as directory:
@@ -417,10 +335,10 @@ class RPC:
             stream.close()
 
 
-def predict(source, cli=None, scratch=None, idle=False, checkpoint=None, task_context=None, timeout=DEFAULT_TIMEOUT, loop_context=None, completed_context=False):
+def predict(source, cli=None, scratch=None, idle=False, timeout=DEFAULT_TIMEOUT, loop_context=None, completed_context=False):
     config = configuration(source.home)
     executable = find_cli(cli)
-    with snapshot(source, scratch=scratch, idle=idle, checkpoint=checkpoint, task_context=task_context, loop_context=loop_context, completed_context=completed_context) as (_, copied, turn, env):
+    with snapshot(source, scratch=scratch, idle=idle, loop_context=loop_context, completed_context=completed_context) as (_, copied, turn, env):
         rpc = RPC(executable, env)
         try:
             rpc.call('initialize', {'clientInfo': {'name': 'martin_prince_loop', 'version': '0.2.0'},
@@ -448,8 +366,8 @@ def predict(source, cli=None, scratch=None, idle=False, checkpoint=None, task_co
     if suggestion is not None and (not isinstance(suggestion, str) or not suggestion.strip()):
         raise RuntimeError('Invalid suggestion format.')
     return {'threadId': source.thread, 'sourceTurnId': turn['turn'], 'promptVersion': config.get('prompt_version'),
-        'method': 'thread/sample', 'context': 'conversation without loop administration' if loop_context is not None else 'isolated task transcript' if task_context is not None else ('isolated active-turn checkpoint' if checkpoint is not None else 'isolated completed-turn snapshot'),
-        **{key: turn[key] for key in ('userFingerprint', 'checkpointDigest', 'removedPendingCalls', 'taskContextDigest', 'taskMessageCount', 'conversationDigest') if key in turn},
+        'method': 'thread/sample', 'context': 'conversation without loop administration' if loop_context is not None else 'isolated completed-turn snapshot',
+        **{key: turn[key] for key in ('userFingerprint', 'conversationDigest') if key in turn},
         'suggestion': suggestion,
         'responseId': result.get('responseId'),
         'usage': {key: result.get(key) for key in ('inputTokens', 'cachedInputTokens', 'outputTokens')}}
@@ -459,8 +377,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--thread', help='Defaults to the current Codex chat environment.')
     parser.add_argument('--before-turn', help='Diagnostic only: sample the intact completed conversation before this invocation turn; never queue a message.')
-    parser.add_argument('--task-context-file', help='Private manifest selecting exact source task messages.')
-    parser.add_argument('--checkpoint-file', help='Factual assistant checkpoint for the current active turn.')
     parser.add_argument('--codex-home')
     parser.add_argument('--sqlite-home')
     parser.add_argument('--cli')
@@ -474,13 +390,9 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     try:
         source = Source.resolve(args.thread, args.codex_home, args.sqlite_home)
-        if args.before_turn and (args.task_context_file or args.checkpoint_file):
-            raise ValueError('Diagnostic --before-turn cannot be combined with another context mode.')
         context = conversation.begin(source.records(), source.thread, args.before_turn) if args.before_turn else None
         result = predict(source,
-            cli=args.cli, scratch=args.scratch, idle=args.require_idle, timeout=args.timeout, loop_context=context,
-            checkpoint=Path(args.checkpoint_file).read_text() if args.checkpoint_file else None,
-            task_context=json.loads(Path(args.task_context_file).read_text()) if args.task_context_file else None)
+            cli=args.cli, scratch=args.scratch, idle=args.require_idle, timeout=args.timeout, loop_context=context)
         if args.output:
             write_json(args.output, result)
         print(json.dumps(result, indent=2))

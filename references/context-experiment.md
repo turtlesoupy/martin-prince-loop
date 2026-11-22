@@ -10,4 +10,4 @@ A nine-sample comparison on November 21, 2026 used the same frozen artwork-task 
 
 The task-focused suggestions asked to inspect the actual GitHub README and confirm the bubble fits, including at a narrow width. Changing only the checkpoint did not remove the feedback loop. This small, single-task comparison supports separating the transcript; it does not establish a general quality improvement or prove that the proposed checks succeed.
 
-The default message mode now requires a task manifest. Selection is explicit and agent-reviewed, not an automatic keyword classifier; preserving substantive requirements while excluding orchestration remains part of the skill workflow. See [SKILL.md](../SKILL.md) for selection and continuation rules. Private transcripts and raw samples are kept outside this repository.
+The skill now gets the same separation without a hand-picked transcript: it records where its own turns start and leaves those ranges out of the copy it samples from. See [SKILL.md](../SKILL.md). Private transcripts and raw samples are kept outside this repository.
