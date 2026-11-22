@@ -99,6 +99,46 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.sampled,[])
         self.assertEqual(self.sent,[])
 
+    def test_delivery_turn_can_precede_its_indexed_message(self):
+        self.finish(); self.tick()
+        con = sqlite3.connect(self.history)
+        con.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)', ('target','delivery','inProgress',3,None))
+        con.commit(); con.close()
+        self.assertTrue(self.tick())
+        self.assertEqual(json.loads(self.path.read_text())['phase'], 'waiting')
+        con = sqlite3.connect(self.history)
+        con.execute('INSERT INTO thread_items VALUES (?,?,?,?,?)',
+            ('target','delivery','userMessage',json.dumps({'content':[{'type':'text','text':'make it sleepy'}]}),3))
+        con.commit(); con.close()
+        self.assertTrue(self.tick())
+        self.assertEqual(json.loads(self.path.read_text())['phase'], 'waiting')
+        self.assertEqual(len(self.sampled),1)
+        self.assertEqual(self.sent,['make it sleepy'])
+
+    def test_rollout_can_precede_delivery_history_without_false_human_stop(self):
+        self.finish(); self.tick()
+        self.records += [event('task_started','delivery'), message('user','make it sleepy')]
+        self.rollout.write_text(''.join(json.dumps(r)+'\n' for r in self.records))
+        self.assertTrue(self.tick())
+        self.assertEqual(json.loads(self.path.read_text())['phase'], 'waiting')
+        self.assertEqual(len(self.sampled),1)
+        self.assertEqual(self.sent,['make it sleepy'])
+        state=json.loads(self.path.read_text());state['deadline']=0;predict.write_json(self.path,state)
+        self.assertFalse(self.tick())
+        self.assertEqual(json.loads(self.path.read_text())['stopReason'], 'Time budget reached.')
+
+    def test_waiting_still_stops_for_indexed_human_input(self):
+        self.finish(); self.tick()
+        con=sqlite3.connect(self.history)
+        con.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)', ('target','human','inProgress',3,None))
+        con.execute('INSERT INTO thread_items VALUES (?,?,?,?,?)',
+            ('target','human','userMessage',json.dumps({'content':[{'type':'text','text':'stop'}]}),3))
+        con.commit();con.close()
+        self.assertFalse(self.tick())
+        self.assertIn('Unexpected human input',json.loads(self.path.read_text())['stopReason'])
+        self.assertEqual(len(self.sampled),1)
+        self.assertEqual(self.sent,['make it sleepy'])
+
     def test_human_input_during_sampling_prevents_queue(self):
         self.finish()
         def racing(source,**kwargs):
@@ -206,11 +246,12 @@ class WorkerTests(unittest.TestCase):
         script=Path(loop.__file__).resolve()
         before=time.monotonic()
         result=subprocess.run([sys.executable,str(script),'start','--state',str(path),
-            '--thread','target','--scope','Draw ASCII cats','--codex-home',str(self.home),
+            '--thread','target','--codex-home',str(self.home),
             '--sqlite-home',str(self.home),'--max-minutes','1'],capture_output=True,text=True,timeout=5)
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertLess(time.monotonic()-before,5)
         state=json.loads(path.read_text())
+        self.assertNotIn('scope',state)
         pid=state['workerPid']
         try:
             os.kill(pid,0)
@@ -252,3 +293,15 @@ class WorkerTests(unittest.TestCase):
         for phase in ('complete', 'stopped', 'waiting', 'dispatching'):
             self.state['phase'] = phase
             self.assertFalse(worker.ensure(self.path, self.state, launcher))
+    def test_worker_shares_configuration_cache_between_predictions(self):
+        caches = []
+        def fake_tick(path, predictor):
+            predictor(self.source, idle=True)
+            return len(caches) < 2
+        def fake_predict(source, **kwargs):
+            caches.append(kwargs['config_cache'])
+        with patch.object(worker, 'tick', fake_tick), patch.object(worker, 'predict', fake_predict), \
+             patch.object(worker.time, 'sleep'):
+            worker.run(self.path)
+        self.assertEqual(len(caches), 2)
+        self.assertIs(caches[0], caches[1])

@@ -92,6 +92,75 @@ class HistoryFixture(unittest.TestCase):
         self.assertEqual(result['promptVersion'], 'test')
         self.assertEqual(list(self.scratch.iterdir()), [])
         self.assertEqual(calls[-1][0], 'closed')
+        stages = result['timingsSeconds']
+        self.assertEqual(set(stages), {'configuration', 'snapshot', 'spawn', 'initialize', 'resume',
+            'sample', 'shutdown', 'snapshotCleanup', 'total'})
+        self.assertTrue(all(value >= 0 for value in stages.values()))
+        self.assertLessEqual(sum(v for k,v in stages.items() if k != 'total'), stages['total'] + .001)
+
+    def test_configuration_cache_refreshes_on_expiry_or_auth_change(self):
+        cache = predict.ConfigurationCache(ttl=60)
+        first = {'prompt':'first','prediction_reasoning_effort':'high'}
+        second = {'prompt':'second','prediction_reasoning_effort':'medium'}
+        with patch.object(predict, 'configuration', side_effect=[first, second, first]) as fetch, \
+             patch.object(predict.time, 'monotonic', return_value=100) as clock:
+            value, hit = cache.get(self.home)
+            self.assertFalse(hit)
+            value['prompt'] = 'caller mutation'
+            clock.return_value = 159
+            value, hit = cache.get(self.home)
+            self.assertTrue(hit)
+            self.assertEqual(value, first)
+            self.assertEqual(fetch.call_count, 1)
+            clock.return_value = 160
+            self.assertEqual(cache.get(self.home), (second, False))
+            (self.home/'auth.json').write_text('{"tokens":{"access_token":"different-test-login"}}')
+            self.assertEqual(cache.get(self.home), (first, False))
+            self.assertEqual(fetch.call_count, 3)
+
+    def test_configuration_cache_does_not_hide_refresh_failure(self):
+        cache = predict.ConfigurationCache(ttl=60)
+        with patch.object(predict, 'configuration', side_effect=[{'prompt':'enabled'}, RuntimeError('disabled'), {'prompt':'new'}]) as fetch, \
+             patch.object(predict.time, 'monotonic', return_value=0) as clock:
+            cache.get(self.home)
+            clock.return_value = 60
+            with self.assertRaisesRegex(RuntimeError, 'disabled'):
+                cache.get(self.home)
+            self.assertIsNone(cache.value)
+            self.assertEqual(cache.get(self.home), ({'prompt':'new'}, False))
+            self.assertEqual(fetch.call_count, 3)
+
+    def test_cached_predictions_preserve_native_prompt_and_reasoning(self):
+        requests = []
+        class FakeRPC:
+            def __init__(self, *args): pass
+            def send(self, data): pass
+            def close(self): pass
+            def call(self, method, params, **kwargs):
+                requests.append((method, params))
+                if method == 'thread/resume':
+                    return {'model':'source-model', 'serviceTier':'default',
+                        'thread':{'turns':[{'id':'done', 'status':'completed'}]}}
+                if method == 'thread/sample':
+                    return {'sourceTurnId':'done', 'responseId':'test', 'text':'{"suggestion":null}'}
+                return {}
+        config = {'prompt':'native prompt', 'prediction_reasoning_effort':'high'}
+        cache = predict.ConfigurationCache()
+        with patch.object(predict, 'configuration', return_value=config) as fetch, \
+             patch.object(predict, 'RPC', FakeRPC), patch.object(predict, 'find_cli', return_value='fake'):
+            cold = predict.predict(self.source, scratch=self.scratch, config_cache=cache)
+            warm = predict.predict(self.source, scratch=self.scratch, config_cache=cache)
+        self.assertFalse(cold['configurationCached'])
+        self.assertTrue(warm['configurationCached'])
+        self.assertEqual(fetch.call_count, 1)
+        samples = [p for m,p in requests if m == 'thread/sample']
+        self.assertEqual(samples[0], samples[1])
+        self.assertEqual(samples[0]['effort'], 'high')
+        self.assertEqual(samples[0]['prompt'], predict.wrapped_prompt(config))
+        self.assertTrue(all('effort' not in p and 'model' not in p for m,p in requests if m == 'thread/resume'))
+        self.assertEqual(warm['model'], 'source-model')
+        self.assertEqual(warm['predictionEffort'], 'high')
+        self.assertEqual(list(self.scratch.iterdir()), [])
 
     def test_private_output_replaces_an_existing_file(self):
         path = Path(self.temp.name) / 'state.json'
@@ -141,6 +210,7 @@ class HistoryFixture(unittest.TestCase):
         self.assertEqual(self.source.user_fingerprint(), predict.user_fingerprint(records))
 
     def test_predict_reports_a_login_rewritten_inside_the_snapshot(self):
+        cache = predict.ConfigurationCache()
         class RefreshingRPC:
             def __init__(self, executable, env):
                 (Path(env['CODEX_HOME']) / 'auth.json').write_text('{"tokens":{"access_token":"rotated"}}')
@@ -155,6 +225,7 @@ class HistoryFixture(unittest.TestCase):
         with patch.object(predict, 'configuration', return_value={'prompt':'p'}), \
              patch.object(predict, 'find_cli', return_value='fake'), patch.object(predict, 'RPC', RefreshingRPC), \
              patch.object(predict.sys, 'stderr'):
-            result = predict.predict(self.source, scratch=self.scratch)
+            result = predict.predict(self.source, scratch=self.scratch, config_cache=cache)
         self.assertTrue(result['authChangedInSnapshot'])
+        self.assertIsNone(cache.value)
         self.assertIn('synthetic-test-token', (self.home / 'auth.json').read_text())

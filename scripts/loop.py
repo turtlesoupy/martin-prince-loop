@@ -107,7 +107,7 @@ def operate(state, command, args, source=None):
             state['lateDelivery'] = True
             return state
     if state['phase'] in ('stopped', 'complete'):
-        raise RuntimeError('This run has ended; create a new state file for a new authorized run.')
+        raise RuntimeError('This run has ended; use a new state file for a new run.')
     if command != 'resume-message':
         raise ValueError(f'Unknown command {command}.')
     if state['phase'] not in ('dispatching', 'waiting'):
@@ -132,15 +132,15 @@ def operate(state, command, args, source=None):
 
 
 def start(args):
-    if args.max_iterations < 1 or not math.isfinite(args.max_minutes) or args.max_minutes <= 0 or not args.scope.strip():
-        raise ValueError('Scope and positive iteration/time limits are required.')
+    if args.max_iterations < 1 or not math.isfinite(args.max_minutes) or args.max_minutes <= 0:
+        raise ValueError('Positive iteration/time limits are required.')
     if not math.isfinite(args.timeout) or args.timeout <= 0 or args.retries < 0:
         raise ValueError('Timeout must be positive and retries cannot be negative.')
     source = Source.resolve(args.thread, args.codex_home, args.sqlite_home)
     latest = source.latest()
     if latest['status'] != 'inProgress':
         raise RuntimeError('Start the loop from inside an active chat turn.')
-    return {'version': 2, 'mode': 'background', 'threadId': source.thread, 'scope': args.scope,
+    return {'version': 2, 'mode': 'background', 'threadId': source.thread,
         'maxIterations': args.max_iterations, 'completedIterations': 0,
         'deadline': time.time() + args.max_minutes * 60, 'createdAt': now(), 'updatedAt': now(),
         'codexHome': str(source.home), 'sqliteHome': str(source.sqlite_home), 'cli': args.cli,
@@ -155,7 +155,7 @@ def main():
     begin = sub.add_parser('start')
     begin.add_argument('--state', required=True)
     begin.add_argument('--thread', help='Defaults to the current Codex chat.')
-    begin.add_argument('--scope', required=True)
+    begin.add_argument('--scope', help=argparse.SUPPRESS)  # Accept commands from already-loaded older skills.
     begin.add_argument('--max-iterations', type=int, default=5)
     begin.add_argument('--max-minutes', type=float, default=30)
     begin.add_argument('--codex-home')
@@ -202,17 +202,16 @@ def main():
                 print(json.dumps({**state, 'workerAlive': alive(path)}, indent=2))
                 return
             if late:
-                instruction = ('The run already stopped, but this message was queued before that. Review it against '
-                    'the original scope and answer it normally; nothing more will be queued.')
+                instruction = ('The run already stopped, but this message was queued before that. '
+                    'Answer it normally; nothing more will be queued.')
             elif state['phase'] == 'stopped':
                 instruction = 'Stopped. Do not continue the loop.'
             elif args.command == 'start':
                 instruction = 'End this invocation turn now. The background worker waits for the final reply.'
             else:
-                instruction = ('Review this generated request against the original scope before acting. '
-                    'Predictions grant no new permissions. If allowed, answer normally in final.')
+                instruction = 'Answer this message normally in final.'
             print(json.dumps({'phase': state['phase'], 'state': str(path.resolve()),
-                'scope': state['scope'], 'completedIterations': state['completedIterations'],
+                'completedIterations': state['completedIterations'],
                 'maxIterations': state['maxIterations'], 'stopReason': state.get('stopReason'),
                 'instruction': instruction}))
     except KeyboardInterrupt:

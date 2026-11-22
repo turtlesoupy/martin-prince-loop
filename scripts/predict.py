@@ -24,6 +24,16 @@ import urllib.request
 
 CONFIG_URL = 'https://chatgpt.com/backend-api/wham/predictions/config'
 DEFAULT_TIMEOUT = 90
+CONFIG_CACHE_SECONDS = 60
+
+
+@contextmanager
+def measured(timings, stage):
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        timings[stage] = time.perf_counter() - started
 
 
 class TransientError(RuntimeError):
@@ -189,6 +199,27 @@ def configuration(home):
     if not config.get('is_enabled') or not isinstance(config.get('prompt'), str) or not config['prompt']:
         raise RuntimeError('The live prediction prompt is disabled or unavailable; no fallback prompt was used.')
     return config
+
+
+class ConfigurationCache:
+    """Brief, worker-local cache; refresh on login changes and never use stale fallback."""
+    def __init__(self, ttl=CONFIG_CACHE_SECONDS):
+        self.ttl = ttl
+        self.clear()
+
+    def clear(self):
+        self.key, self.value, self.expires = None, None, 0
+
+    def get(self, home):
+        home = Path(home).resolve()
+        key = (str(home), hashlib.sha256((home / 'auth.json').read_bytes()).digest())
+        if key == self.key and time.monotonic() < self.expires:
+            return copy.deepcopy(self.value), True
+        self.clear()
+        value = configuration(home)
+        self.key, self.value = key, copy.deepcopy(value)
+        self.expires = time.monotonic() + self.ttl
+        return copy.deepcopy(value), False
 
 
 def wrapped_prompt(config):
@@ -383,27 +414,41 @@ def auth_differs(source_home, snapshot_home):
         return False
 
 
-def predict(source, cli=None, scratch=None, idle=False, timeout=DEFAULT_TIMEOUT, loop_context=None, completed_context=False):
-    config = configuration(source.home)
+def predict(source, cli=None, scratch=None, idle=False, timeout=DEFAULT_TIMEOUT, loop_context=None, completed_context=False, config_cache=None):
+    started, timings = time.perf_counter(), {}
+    with measured(timings, 'configuration'):
+        config, cache_hit = config_cache.get(source.home) if config_cache is not None else (configuration(source.home), False)
+    effort = config.get('prediction_reasoning_effort')
     executable = find_cli(cli)
+    snapshot_started = time.perf_counter()
     with snapshot(source, scratch=scratch, idle=idle, loop_context=loop_context, completed_context=completed_context) as (_, copied, turn, env):
-        rpc = RPC(executable, env)
+        timings['snapshot'] = time.perf_counter() - snapshot_started
+        with measured(timings, 'spawn'):
+            rpc = RPC(executable, env)
         try:
-            rpc.call('initialize', {'clientInfo': {'name': 'martin_prince_loop', 'version': '0.2.0'},
-                'capabilities': {'experimentalApi': True}}, timeout=timeout)
+            with measured(timings, 'initialize'):
+                rpc.call('initialize', {'clientInfo': {'name': 'martin_prince_loop', 'version': '0.2.0'},
+                    'capabilities': {'experimentalApi': True}}, timeout=timeout)
             rpc.send({'method': 'initialized'})
-            loaded = rpc.call('thread/resume', {'threadId': source.thread, 'path': str(copied)}, timeout=timeout)['thread']
-            turns = loaded.get('turns', [])
+            with measured(timings, 'resume'):
+                resumed = rpc.call('thread/resume', {'threadId': source.thread, 'path': str(copied)}, timeout=timeout)
+            turns = resumed['thread'].get('turns', [])
             if not turns or turns[-1]['id'] != turn['turn'] or turns[-1]['status'] != 'completed':
                 raise RuntimeError('Snapshot did not end at the expected completed turn.')
-            result = rpc.call('thread/sample', {'threadId': source.thread, 'expectedTurnId': turn['turn'],
-                'prompt': wrapped_prompt(config), 'effort': config.get('prediction_reasoning_effort'),
-                'threadSource': 'composer_predictions', 'turnTrigger': 'composer_predictions',
-                'responsesapiClientMetadata': {'prediction_source_thread_id': source.thread,
-                    'prediction_source_turn_id': turn['turn'], 'prediction_trigger': 'catch_up'}, 'disableMcp': True}, timeout=timeout)
+            with measured(timings, 'sample'):
+                result = rpc.call('thread/sample', {'threadId': source.thread, 'expectedTurnId': turn['turn'],
+                    'prompt': wrapped_prompt(config), 'effort': effort,
+                    'threadSource': 'composer_predictions', 'turnTrigger': 'composer_predictions',
+                    'responsesapiClientMetadata': {'prediction_source_thread_id': source.thread,
+                        'prediction_source_turn_id': turn['turn'], 'prediction_trigger': 'catch_up'}, 'disableMcp': True}, timeout=timeout)
         finally:
-            rpc.close()
+            with measured(timings, 'shutdown'):
+                rpc.close()
             auth_changed = auth_differs(source.home, Path(env['CODEX_HOME']))
+            if auth_changed and config_cache is not None:
+                config_cache.clear()
+        cleanup_started = time.perf_counter()
+    timings['snapshotCleanup'] = time.perf_counter() - cleanup_started
     if auth_changed:
         # The copy is about to be deleted. If the login was refreshed there and
         # refresh tokens rotate, the real install may be left with a revoked one.
@@ -419,12 +464,17 @@ def predict(source, cli=None, scratch=None, idle=False, timeout=DEFAULT_TIMEOUT,
     suggestion = decoded['suggestion']
     if suggestion is not None and (not isinstance(suggestion, str) or not suggestion.strip()):
         raise RuntimeError('Invalid suggestion format.')
+    timings['total'] = time.perf_counter() - started
     return {'threadId': source.thread, 'sourceTurnId': turn['turn'], 'promptVersion': config.get('prompt_version'),
         'method': 'thread/sample', 'context': 'conversation without loop administration' if loop_context is not None else 'isolated completed-turn snapshot',
         **{key: turn[key] for key in ('userFingerprint', 'conversationDigest') if key in turn},
         'suggestion': suggestion,
         'authChangedInSnapshot': auth_changed,
         'responseId': result.get('responseId'),
+        'predictionEffort': effort,
+        'configurationCached': cache_hit,
+        'model': resumed.get('model'), 'serviceTier': resumed.get('serviceTier'),
+        'timingsSeconds': {key: round(value, 4) for key, value in timings.items()},
         'usage': {key: result.get(key) for key in ('inputTokens', 'cachedInputTokens', 'outputTokens')}}
 
 

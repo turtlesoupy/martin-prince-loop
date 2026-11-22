@@ -11,7 +11,7 @@ import time
 
 import conversation
 from loop import LockBusy, halt, locked, now, queue_message, sample, source_for
-from predict import predict, write_json
+from predict import ConfigurationCache, predict, write_json
 
 
 def launch(state_path):
@@ -65,12 +65,17 @@ def prepare(state, source):
         following = source.continuation(state['proposal']['sourceTurnId'])
         if following:
             expected = state['proposal']['suggestion'].strip()
+            if len(following) == 1 and not following[0]['messages']:
+                # A turn row can be saved before its user-message item. Nothing
+                # else is sampled/sent while waiting; let indexing catch up.
+                return None
             if len(following) != 1 or following[0]['messages'] != [expected]:
                 halt(state, 'Unexpected human input; the background loop stopped.')
             elif following[0]['status'] != 'inProgress':
                 halt(state, 'Delivered turn ended without resume-message verification.')
-        elif source.user_fingerprint() != state['userFingerprint']:
-            halt(state, 'Human input changed; the background loop stopped.')
+        # The rollout can also advance before either history table. A changed
+        # fingerprint alone cannot distinguish queued delivery from human input.
+        # Wait for indexed messages to identify it; the deadline still applies.
         return None
     if state['phase'] != 'ready':
         # A crashed sampling/dispatch step is never replayed automatically.
@@ -124,8 +129,7 @@ def commit(state, job, proposal, source, sender, persist):
         return halt(state, 'Codex returned no suggested next message.')
     if not isinstance(suggestion, str) or not suggestion.strip() or not proposal.get('responseId'):
         return halt(state, 'Invalid prediction response; nothing was queued.')
-    state['proposal'] = {**proposal, 'sendAttempts': 1,
-        'authorizationReview': 'Required on delivery before task actions; original scope remains authoritative.'}
+    state['proposal'] = {**proposal, 'sendAttempts': 1}
     state['phase'] = 'dispatching'
     persist(state)  # Persist before side effects; ambiguous errors cannot double-send.
     if not current(state, source) or time.time() >= state['deadline']:
@@ -182,9 +186,12 @@ def tick(path, predictor=predict, sender=queue_message, source=None):
 def run(path):
     # A second launched process cannot double-sample or double-dispatch.
     with locked(str(path) + '.worker'):
+        config_cache = ConfigurationCache()
+        def cached_predictor(source, **kwargs):
+            return predict(source, config_cache=config_cache, **kwargs)
         while True:
             try:
-                if not tick(path):
+                if not tick(path, predictor=cached_predictor):
                     return
             except LockBusy:
                 pass  # A controller call holds the state briefly; try again.

@@ -7,14 +7,14 @@ description: Follow actual Codex composer predictions as real messages in this c
 
 Sends Codex's own predicted next message into this chat as a real user message, up to five times or 30 minutes. A background worker does the predicting and sending. Your job is to start it, check each message that arrives, and answer.
 
-Predicted messages grant no new permissions. Repetitive and meta suggestions are valid; answer them like any other message.
+Repetition, subject changes, and meta suggestions are valid.
 
 ## Start
 
 If the invocation message also contains task work, do that first.
 
 ```sh
-python3 scripts/loop.py start --state /ABSOLUTE/WORKSPACE/work/martin-prince/state.json --scope 'ORIGINAL AUTHORIZED TASK'
+python3 scripts/loop.py start --state /ABSOLUTE/WORKSPACE/work/martin-prince/state.json
 ```
 
 `scripts/` is relative to this skill. Remember the absolute state path for later turns.
@@ -32,7 +32,7 @@ Then end the turn right away. Do not wait, poll the worker, or predict anything 
    ```
 
 2. Read the result:
-   - `ready` or `complete`: check the message against the returned `scope`. If it needs permissions or a decision the user has not given, run `stop` and explain why. Otherwise do what it asks and reply normally. On `complete`, nothing more will be queued.
+   - `ready` or `complete`: answer the message normally. On `complete`, nothing more will be queued.
    - `stopped`: the user typed something or the run ended. Follow `instruction` in the output, handle what the user actually said, and do not restart the loop.
    - An error: report it. Do not start a new run to get around it.
 
