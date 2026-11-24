@@ -25,6 +25,10 @@ $martin-prince-loop
 $martin-prince-loop turns=3 timeout=10m draw a sleepy kitten
 ```
 
+After the skill is invoked, every follow-up message shown below is predicted and sent automatically.
+
+<img src="assets/loop-example.png" alt="An ASCII dog gains a body and legs as Martin Prince Loop automatically sends follow-up requests." width="640">
+
 A background worker waits for each reply to finish, samples a fresh prediction from a temporary copy of the chat, and queues it with `codex queue`. Replies aren't held up by the prediction. The loop stops early on a null prediction, an error, a message you type yourself, or anything that needs your approval.
 
 The predictor sees the conversation without the loop's own bookkeeping, so it suggests next steps for your task rather than "keep looping".
