@@ -1,4 +1,5 @@
 """Keep conversation work intact while excluding controller execution by boundaries."""
+import copy
 import hashlib
 import json
 
@@ -20,14 +21,38 @@ def segment(records, start, end):
     return {'start': start, 'end': end, 'sha256': digest(records[start:end])}
 
 
-def begin(records, thread, invocation_turn):
+def begin(records, thread, invocation_turn, prompt=None):
     end = turn_start(records, invocation_turn)
     context = {'version': 1, 'threadId': thread, 'segments': [segment(records, 0, end)]}
+    prompt_saved = False
     # Preserve runtime updates even when the invocation itself is omitted.
     for i in range(end, len(records)):
         r = records[i]
-        if r.get('type') == 'response_item' and r.get('payload', {}).get('role') in ('system', 'developer'):
+        p = r.get('payload', {})
+        if r.get('type') != 'response_item':
+            continue
+        if p.get('role') in ('system', 'developer'):
             context['segments'].append(segment(records, i, i + 1))
+        elif prompt is not None and not prompt_saved and p.get('role') == 'user' and p.get('type') == 'message':
+            for index, part in enumerate(p.get('content', [])):
+                text = part.get('text', '')
+                # Skill bodies are injected as user messages too. Their examples
+                # must never supply a task missing from the actual invocation.
+                if text.lstrip().startswith('<skill>'):
+                    continue
+                if part.get('type') == 'input_text' and prompt in text:
+                    # Replace only the invocation text, retaining its original
+                    # attachments and other content parts. Never edit the source.
+                    context['segments'].append({**segment(records, i, i + 1),
+                        'prompt': prompt, 'contentIndex': index})
+                    prompt_saved = True
+                    break
+    if prompt is not None:
+        if not prompt_saved:
+            raise ValueError('Prompt must be verbatim task text from the invocation message.')
+        # Start runs before task work. The controller output is excluded as an
+        # orphan; the actual task tools and final answer are captured on completion.
+        context['workStart'] = len(records)
     return context
 
 
@@ -61,6 +86,10 @@ def project(records, context, thread):
         selected = records[start:end]
         if digest(selected) != part['sha256']:
             raise ValueError('Conversation source changed; do not silently rebase.')
+        if 'prompt' in part:
+            selected = copy.deepcopy(selected)
+            content = selected[0]['payload']['content'][part['contentIndex']]
+            content['text'] = part['prompt']
         kept.extend(selected)
         previous = end
     # The resume controller call starts outside task work, but its output can land

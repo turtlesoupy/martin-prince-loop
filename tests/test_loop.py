@@ -5,9 +5,45 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import loop
+
+
+class StartTests(unittest.TestCase):
+    def start(self, *options):
+        _, args = loop.parse_args(['start', '--state', '/unused/state.json', *options])
+        source = SimpleNamespace(thread='thread', home=Path('/source'), sqlite_home=Path('/source'),
+            latest=lambda: {'turn': 'invoke', 'status': 'inProgress'}, user_fingerprint=lambda: 'fingerprint',
+            records=lambda: [{'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'invoke'}}])
+        with patch.object(loop.Source, 'resolve', return_value=source), patch.object(loop.time, 'time', return_value=1000):
+            return loop.start(args)
+
+    def test_default_and_custom_budgets(self):
+        defaults = self.start()
+        self.assertEqual(defaults['maxIterations'], 5)
+        self.assertEqual(defaults['deadline'], 2800)
+        for duration, seconds in [('90', 90), ('90s', 90), ('2.5m', 150), ('1h', 3600)]:
+            with self.subTest(duration=duration):
+                state = self.start('--turns', '3', '--run-timeout', duration, '--request-timeout', '7')
+                self.assertEqual(state['maxIterations'], 3)
+                self.assertEqual(state['deadline'], 1000 + seconds)
+                self.assertEqual(state['timeout'], 7)
+        legacy = self.start('--max-iterations', '2', '--max-minutes', '4', '--timeout', '8')
+        self.assertEqual((legacy['maxIterations'], legacy['deadline'], legacy['timeout']), (2, 1240, 8))
+
+    def test_invalid_limits_and_empty_prompt_fail_before_reading_source(self):
+        for options in [('--turns', '0'), ('--max-minutes', 'nan'), ('--max-minutes', '-1'),
+                ('--request-timeout', '0'), ('--prompt', '  ')]:
+            with self.subTest(options=options):
+                _, args = loop.parse_args(['start', '--state', '/unused/state.json', *options])
+                with patch.object(loop.Source, 'resolve') as resolve, self.assertRaises(ValueError):
+                    loop.start(args)
+                resolve.assert_not_called()
+        for value in ('0', '-1s', 'nan', 'inf', 'forever', '1e309s'):
+            with self.subTest(duration=value), self.assertRaises(loop.argparse.ArgumentTypeError):
+                loop.duration(value)
 
 
 class RetryTests(unittest.TestCase):

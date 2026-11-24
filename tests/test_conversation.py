@@ -18,6 +18,34 @@ def call(id, output=False):
 
 
 class ConversationTests(unittest.TestCase):
+    def test_prompt_and_attachments_survive_without_invocation_or_controller(self):
+        prompt = 'Explain the loop shown in this image'
+        request = msg('user', '$martin-prince-loop turns=3 timeout=10m ' + prompt)
+        attachment = {'type': 'input_image', 'image_url': 'data:image/png;base64,unchanged', 'detail': 'original'}
+        request['payload']['content'].append(attachment)
+        records = [msg('user', 'prior context'), start('invoke'), msg('developer', 'runtime update'),
+            request, msg('user', '<skill>controller instructions</skill>'), call('init')]
+        context = conversation.begin(records, 'thread', 'invoke', prompt)
+        records += [call('init', True), call('inspect-image'), call('inspect-image', True),
+            msg('assistant', 'The image shows a loop.')]
+        before = copy.deepcopy(records)
+        conversation.capture(context, records)
+        closed = conversation.project(records, context, 'thread')
+        expected = msg('user', prompt)
+        expected['payload']['content'].append(attachment)
+        self.assertEqual(closed, [records[0], records[2], expected, *records[-3:]])
+        self.assertEqual(records, before)
+        records[3]['payload']['content'][0]['text'] = 'changed input'
+        with self.assertRaisesRegex(ValueError, 'source changed'):
+            conversation.project(records, context, 'thread')
+
+    def test_prompt_must_come_from_current_invocation(self):
+        records = [msg('user', 'draw a dog'), start('invoke'), msg('user', '$martin-prince-loop draw a cat'),
+            msg('user', '<skill>Example: draw a kitten</skill>')]
+        for prompt in ('draw a dog', 'invented task', 'draw a kitten'):
+            with self.subTest(prompt=prompt), self.assertRaisesRegex(ValueError, 'verbatim'):
+                conversation.begin(records, 'thread', 'invoke', prompt)
+
     def test_preserves_task_tools_and_messages_excludes_controller(self):
         records = [msg('developer','runtime'), start('task'), msg('user','draw a cat'),
             call('ordinary'), call('ordinary', True), msg('assistant','cat'), start('invoke'),

@@ -92,6 +92,63 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(self.tick())
         self.assertEqual(len(self.sampled),1)
 
+    def test_supplied_prompt_runs_before_first_prediction_with_actual_answer(self):
+        prompt = 'draw a puppy from this image'
+        image = {'type':'input_image','image_url':'data:image/png;base64,original-image'}
+        request = message('user', '$martin-prince-loop turns=1 timeout=10m ' + prompt)
+        request['payload']['content'].append(image)
+        self.records[7:] = [request, message('user', '<skill>loop setup instructions</skill>'),
+            {'type':'response_item','payload':{'type':'function_call','call_id':'start','arguments':'loop.py start'}}]
+        self.save_records('inProgress')
+        _, args = loop.parse_args(['start','--state',str(self.path),'--turns','1','--run-timeout','10m',
+            '--prompt',prompt,'--scratch',str(self.scratch)])
+        with patch.object(loop.Source, 'resolve', return_value=self.source):
+            state = loop.start(args)
+        predict.write_json(self.path, state)
+        def unexpected(*args, **kwargs):
+            self.fail('No prediction before the supplied task is answered')
+        self.assertTrue(self.tick(predictor=unexpected))
+        answer = ' / \\__\n(    @\\___\n /         O'
+        self.records += [
+            {'type':'response_item','payload':{'type':'function_call_output','call_id':'start','output':'controller instruction'}},
+            {'type':'response_item','payload':{'type':'function_call','call_id':'draw','arguments':'draw puppy'}},
+            {'type':'response_item','payload':{'type':'function_call_output','call_id':'draw','output':'puppy drawing'}},
+            message('assistant',answer,'final_answer'),event('task_complete','busy')]
+        self.save_records('completed')
+        def next_prediction(source, **kwargs):
+            with predict.snapshot(source, scratch=self.scratch, idle=True,
+                    loop_context=kwargs['loop_context'], completed_context=True) as (_, copied, turn, _):
+                rows = [json.loads(line) for line in copied.read_text().splitlines()]
+                inputs = [r['payload'] for r in rows if r.get('type') == 'response_item' and r['payload'].get('role') == 'user']
+                self.assertEqual(inputs[-1]['content'], [{'type':'input_text','text':prompt}, image])
+                responses = [r['payload'] for r in rows if r.get('type') == 'response_item' and r['payload'].get('role') == 'assistant']
+                self.assertEqual(responses[-1]['content'][0]['text'], answer)
+                calls = [r['payload'].get('call_id') for r in rows if r.get('type') == 'response_item' and 'call_id' in r['payload']]
+                self.assertEqual(calls, ['draw', 'draw'])
+                text = copied.read_text()
+                for excluded in ('$martin-prince-loop', 'loop setup instructions', 'controller instruction', 'timeout=10m'):
+                    self.assertNotIn(excluded, text)
+                self.assertEqual(rows[-1]['payload']['last_agent_message'], answer)
+                self.sampled.append(text)
+                return {'sourceTurnId':turn['turn'],'responseId':'first-prediction','suggestion':'give the puppy a friend',
+                    'userFingerprint':turn['userFingerprint'],'conversationDigest':turn['conversationDigest']}
+        self.assertTrue(self.tick(predictor=next_prediction))
+        self.assertEqual(len(self.sampled), 1)
+        self.assertEqual(self.sent, ['give the puppy a friend'])
+        self.assertEqual(json.loads(self.path.read_text())['completedIterations'], 0)
+        self.records += [event('task_started','delivery'),message('user','give the puppy a friend')]
+        self.rollout.write_text(''.join(json.dumps(r)+'\n' for r in self.records))
+        con = sqlite3.connect(self.history)
+        con.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)',('target','delivery','inProgress',3,None))
+        con.execute('INSERT INTO thread_items VALUES (?,?,?,?,?)',('target','delivery','userMessage',
+            json.dumps({'content':[{'type':'text','text':'give the puppy a friend'}]}),3))
+        con.commit(); con.close()
+        state = loop.operate(json.loads(self.path.read_text()), 'resume-message', SimpleNamespace(), source=self.source)
+        self.assertEqual(state['phase'], 'complete')
+        self.assertEqual(state['completedIterations'], 1)
+        predict.write_json(self.path, state)
+        self.assertFalse(self.tick(predictor=unexpected))
+
     def test_human_input_before_sampling_stops_without_network_call(self):
         self.records.append(message('user','stop'))
         self.save_records('inProgress')

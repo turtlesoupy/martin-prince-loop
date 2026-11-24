@@ -22,6 +22,7 @@ In any Codex chat:
 
 ```
 $martin-prince-loop
+$martin-prince-loop turns=3 timeout=10m draw a sleepy kitten
 ```
 
 A background worker waits for each reply to finish, samples a fresh prediction from a temporary copy of the chat, and queues it with `codex queue`. Replies aren't held up by the prediction. The loop stops early on a null prediction, an error, a message you type yourself, or anything that needs your approval.

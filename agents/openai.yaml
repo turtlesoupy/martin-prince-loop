@@ -1,4 +1,4 @@
 interface:
   display_name: "Martin Prince Loop"
   short_description: "Send real Codex predictions as chat messages"
-  default_prompt: "Use $martin-prince-loop to send and follow five real predicted chat messages here, including meta suggestions."
+  default_prompt: "Use $martin-prince-loop to follow predicted chat messages here."

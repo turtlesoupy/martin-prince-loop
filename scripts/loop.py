@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import time
@@ -134,35 +135,54 @@ def operate(state, command, args, source=None):
 def start(args):
     if args.max_iterations < 1 or not math.isfinite(args.max_minutes) or args.max_minutes <= 0:
         raise ValueError('Positive iteration/time limits are required.')
+    run_timeout = args.run_timeout if args.run_timeout is not None else args.max_minutes * 60
+    if not math.isfinite(run_timeout) or run_timeout <= 0:
+        raise ValueError('Run timeout must be positive and finite.')
     if not math.isfinite(args.timeout) or args.timeout <= 0 or args.retries < 0:
         raise ValueError('Timeout must be positive and retries cannot be negative.')
+    if args.prompt is not None and not args.prompt.strip():
+        raise ValueError('Prompt cannot be empty; omit --prompt for a bare invocation.')
     source = Source.resolve(args.thread, args.codex_home, args.sqlite_home)
     latest = source.latest()
     if latest['status'] != 'inProgress':
         raise RuntimeError('Start the loop from inside an active chat turn.')
     return {'version': 2, 'mode': 'background', 'threadId': source.thread,
         'maxIterations': args.max_iterations, 'completedIterations': 0,
-        'deadline': time.time() + args.max_minutes * 60, 'createdAt': now(), 'updatedAt': now(),
+        'deadline': time.time() + run_timeout, 'createdAt': now(), 'updatedAt': now(),
         'codexHome': str(source.home), 'sqliteHome': str(source.sqlite_home), 'cli': args.cli,
         'timeout': args.timeout, 'retries': args.retries, 'scratch': args.scratch, 'phase': 'ready', 'history': [],
-        'conversationContext': conversation.begin(source.records(), source.thread, latest['turn']),
+        'conversationContext': conversation.begin(source.records(), source.thread, latest['turn'], args.prompt),
         'originTurnId': latest['turn'], 'userFingerprint': source.user_fingerprint()}
 
 
-def main():
+def duration(value):
+    """Parse a run timeout in seconds, or with an s/m/h suffix."""
+    match = re.fullmatch(r'(\d+(?:\.\d+)?)([smh]?)', value.strip(), re.IGNORECASE)
+    if match:
+        seconds = float(match[1]) * {'': 1, 's': 1, 'm': 60, 'h': 3600}[match[2].lower()]
+        if math.isfinite(seconds) and seconds > 0:
+            return seconds
+    raise argparse.ArgumentTypeError('Use a positive duration such as 90s, 10m, or 1h (bare numbers are seconds).')
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     begin = sub.add_parser('start')
     begin.add_argument('--state', required=True)
     begin.add_argument('--thread', help='Defaults to the current Codex chat.')
     begin.add_argument('--scope', help=argparse.SUPPRESS)  # Accept commands from already-loaded older skills.
-    begin.add_argument('--max-iterations', type=int, default=5)
-    begin.add_argument('--max-minutes', type=float, default=30)
+    begin.add_argument('--turns', '--max-iterations', dest='max_iterations', type=int, default=5,
+        help='Maximum predicted follow-up turns, excluding the supplied initial prompt (default: 5).')
+    budget = begin.add_mutually_exclusive_group()
+    budget.add_argument('--run-timeout', type=duration, help='Overall run duration, e.g. 10m or 1h (default: 30m).')
+    budget.add_argument('--max-minutes', type=float, default=30, help='Overall run duration in minutes.')
+    begin.add_argument('--prompt', help='Verbatim task text from this invocation; answer it after starting the worker.')
     begin.add_argument('--codex-home')
     begin.add_argument('--sqlite-home')
     begin.add_argument('--cli')
     begin.add_argument('--scratch')
-    begin.add_argument('--timeout', type=float, default=DEFAULT_TIMEOUT,
+    begin.add_argument('--request-timeout', '--timeout', dest='timeout', type=float, default=DEFAULT_TIMEOUT,
         help='Seconds to wait on each prediction request or codex queue call.')
     begin.add_argument('--retries', type=int, default=0, help='Extra attempts after a transient prediction failure.')
     for name in ('resume-message', 'status', 'stop'):
@@ -170,7 +190,11 @@ def main():
         cmd.add_argument('--state', required=True)
         if name == 'stop':
             cmd.add_argument('--reason', required=True)
-    args = parser.parse_args()
+    return parser, parser.parse_args(argv)
+
+
+def main():
+    parser, args = parse_args()
     def interrupted(*_):
         raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM, interrupted)
@@ -207,7 +231,10 @@ def main():
             elif state['phase'] == 'stopped':
                 instruction = 'Stopped. Do not continue the loop.'
             elif args.command == 'start':
-                instruction = 'End this invocation turn now. The background worker waits for the final reply.'
+                instruction = ('Do the supplied task now and answer normally in final. The background worker '
+                    'waits for the saved answer before predicting a follow-up.' if args.prompt is not None else
+                    'End this invocation turn now with an empty final response and no acknowledgment. '
+                    'The background worker waits for turn completion.')
             else:
                 instruction = 'Answer this message normally in final.'
             print(json.dumps({'phase': state['phase'], 'state': str(path.resolve()),

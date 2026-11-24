@@ -5,13 +5,21 @@ description: Follow actual Codex composer predictions as real messages in this c
 
 # Martin Prince Loop
 
-Sends Codex's own predicted next message into this chat as a real user message, up to five times or 30 minutes. A background worker does the predicting and sending. Your job is to start it, check each message that arrives, and answer.
+Sends Codex's own predicted next message into this chat as a real user message. Defaults to five predicted follow-up turns or 30 minutes, whichever comes first. A background worker does the predicting and sending. Your job is to start it, check each message that arrives, and answer.
 
 Repetition, subject changes, and meta suggestions are valid.
 
 ## Start
 
-If the invocation message also contains task work, do that first.
+Accept optional `turns=N` and `timeout=DURATION` in the invocation, or equivalent natural language. For example:
+
+```text
+$martin-prince-loop turns=3 timeout=10m draw a sleepy kitten in one line
+```
+
+Map these to `--turns 3 --run-timeout 10m` on the start command. Duration accepts `s`, `m`, or `h`; a bare number means seconds. Turns count predicted follow-ups, excluding the supplied initial prompt. The timeout covers the whole run from startup; it stops further messages without interrupting an answer already in progress.
+
+Start once, before doing any supplied task work, and keep this call separate from task tools:
 
 ```sh
 python3 scripts/loop.py start --state /ABSOLUTE/WORKSPACE/work/martin-prince/state.json
@@ -19,9 +27,11 @@ python3 scripts/loop.py start --state /ABSOLUTE/WORKSPACE/work/martin-prince/sta
 
 `scripts/` is relative to this skill. Remember the absolute state path for later turns.
 
-Options, only when the user asks: `--max-iterations N` (default 5), `--max-minutes N` (default 30), `--timeout SECONDS` (default 90, per prediction or queue call), `--retries N` (default 0, extra prediction attempts).
+If the invocation includes a task, pass its verbatim task text as `--prompt TEXT`, excluding the skill invocation and loop options. Preserve file references and task constraints; quote it safely as one argument. After startup, do that task and send its actual answer in final. The worker retains the prompt, attachments, task tools, and answer, then predicts the next message. Do not queue or sample a replacement for the supplied prompt.
 
-Then end the turn right away. Do not wait, poll the worker, or predict anything yourself. Never reuse or overwrite an existing state file to get more iterations.
+For a bare invocation (including one with only loop options), end the turn right away with an empty final response and no acknowledgment text. Do not wait, poll the worker, or predict anything yourself. Never reuse or overwrite an existing state file to get more iterations.
+
+Advanced options, only when requested: `--request-timeout SECONDS` (default 90, per prediction or queue call), `--retries N` (default 0, extra prediction attempts). Existing `--max-iterations`, `--max-minutes`, and per-request `--timeout` command flags remain supported.
 
 ## When a predicted message arrives
 
@@ -40,7 +50,7 @@ Then end the turn right away. Do not wait, poll the worker, or predict anything 
 
 ## Keep it quiet
 
-Do not mention the loop in replies: no counters, state paths, receipts, or announcements of what is queued. For the bare invocation, reply with one short acknowledgment or nothing.
+Do not mention the loop in replies: no counters, state paths, receipts, or announcements of what is queued. Do not add startup acknowledgments such as "Okay," "Started," or "Done."
 
 ## Stopping and problems
 
