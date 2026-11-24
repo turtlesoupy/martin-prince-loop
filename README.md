@@ -1,8 +1,8 @@
-![ASCII Martin Prince saying "yolo"](assets/martin-prince.svg)
-
 # Martin Prince Loop
 
 A Codex skill that takes Codex's own composer prediction (the suggested next message) and sends it back as a real user message, then does it again. Meta suggestions, repeats, and "keep going" all count. It stops after five messages or 30 minutes by default.
+
+![ASCII Martin Prince saying "yolo"](assets/martin-prince.svg)
 
 ## Install
 
